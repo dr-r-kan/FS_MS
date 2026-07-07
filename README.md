@@ -1,0 +1,1 @@
+This is a repository for applying microstate methods to clinical EEG in seizures (ES and FS)
