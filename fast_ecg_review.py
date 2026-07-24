@@ -180,7 +180,7 @@ def detect_rpeaks(signal: np.ndarray, sfreq: float, settings: dict) -> np.ndarra
     import neurokit2 as nk
 
     _, info = nk.ecg_process(ecg_signal=signal, sampling_rate=sfreq)
-    return adaptive_fix(np.asarray(info["ECG_R_Peaks"], dtype=int), sfreq, settings)
+    return np.unique(np.asarray(info["ECG_R_Peaks"], dtype=int))
 
 
 def adaptive_fix(rpeaks: np.ndarray, sfreq: float, settings: dict) -> np.ndarray:
@@ -282,6 +282,54 @@ def recover_missing_rpeaks(
             break
         current = np.unique(np.r_[current, accepted]).astype(int)
     return current, stats
+
+
+def rpeak_qc_score(rpeaks: np.ndarray, sfreq: float, n_samples: int, settings: dict) -> dict:
+    """Summarise physiologically usable 60-s coverage without changing peaks."""
+    peaks = np.unique(np.asarray(rpeaks, dtype=int)) / float(sfreq)
+    duration = n_samples / float(sfreq)
+    total_windows = max(1, int(np.floor(duration / 60.0)))
+    valid_windows = 0
+    if len(peaks) >= 3:
+        rr = np.diff(peaks)
+        bpm = 60.0 / rr
+        mids = (peaks[:-1] + peaks[1:]) / 2
+        for index in range(total_windows):
+            lo, hi = index * 60.0, (index + 1) * 60.0
+            use = (mids >= lo) & (mids < hi)
+            if not np.any(use):
+                continue
+            coverage = np.maximum(0, np.minimum(peaks[1:], hi) - np.maximum(peaks[:-1], lo)).sum() / 60.0
+            if (coverage >= .80 and np.max(rr[use]) <= 5.0 and
+                    np.all((bpm[use] >= settings["rr_min_bpm"]) & (bpm[use] <= settings["rr_max_bpm"]))):
+                valid_windows += 1
+    return {
+        "peak_count": int(len(peaks)),
+        "first_peak_s": float(peaks[0]) if len(peaks) else np.nan,
+        "last_peak_s": float(peaks[-1]) if len(peaks) else np.nan,
+        "duration_s": duration,
+        "valid_60s_windows": valid_windows,
+        "total_60s_windows": total_windows,
+        "valid_60s_fraction": valid_windows / total_windows,
+    }
+
+
+def write_recovery_sidecar(path: Path, rpeaks: np.ndarray, sfreq: float,
+                           detected: np.ndarray, reviewed: np.ndarray, tolerance_s: float = .05) -> dict:
+    """Write peak times plus their auditable source; only gap-added peaks are recovered."""
+    tolerance = max(1, int(round(tolerance_s * sfreq)))
+    detected = np.asarray(detected, dtype=int)
+    reviewed = np.asarray(reviewed, dtype=int)
+    rows, counts = [], {"reviewed": 0, "full_record_detector": 0, "gap_recovered": 0}
+    for peak in np.unique(np.asarray(rpeaks, dtype=int)):
+        near_reviewed = len(reviewed) and np.min(np.abs(reviewed - peak)) <= tolerance
+        near_detected = len(detected) and np.min(np.abs(detected - peak)) <= tolerance
+        source = "reviewed" if near_reviewed else ("full_record_detector" if near_detected else "gap_recovered")
+        counts[source] += 1
+        rows.append({"rpeak_time_s": peak / float(sfreq), "rpeak_source": source,
+                     "is_gap_recovered": int(source == "gap_recovered")})
+    write_dicts(path, rows)
+    return counts
 
 
 def heppy_peak_module():
@@ -658,7 +706,8 @@ class QrsEditor:
         raw.load_data()
         if truthy(self.row.get("flip")):
             raw._data[0] *= -1
-        raw.filter(l_freq=self.settings["hp"], h_freq=self.settings["lp"], verbose="ERROR")
+        # ECG channels are often typed as misc; MNE's default data picks then select nothing.
+        raw.filter(l_freq=self.settings["hp"], h_freq=self.settings["lp"], picks="all", verbose="ERROR")
         self.sfreq = float(raw.info["sfreq"])
         self.signal = raw.get_data()[0].astype(float)
         sidecar = corrected_path(self.heppy_output / "ecg_qc", clean(self.row.get("base")))
@@ -816,6 +865,11 @@ def self_check() -> None:
         assert stats["duplicate_dropped"] == 1
         estimates, uncertain = missing_peak_estimates(np.array([0, 100, 400, 500]), 100.0, {"rr_min_bpm": 35, "rr_max_bpm": 140})
         assert estimates == [200, 300] and uncertain == 0
+        qc = rpeak_qc_score(np.arange(50, 6050, 100), 100.0, 6100, {"rr_min_bpm": 35, "rr_max_bpm": 140})
+        assert qc["valid_60s_windows"] == 1 and qc["valid_60s_fraction"] == 1
+        sources = write_recovery_sidecar(root / "peaks.csv", np.array([100, 200, 300]), 100.0,
+                                         np.array([100, 200]), np.array([100]))
+        assert sources == {"reviewed": 1, "full_record_detector": 1, "gap_recovered": 1}
 
 
 def parse_args() -> argparse.Namespace:
@@ -837,6 +891,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-report", type=Path, default=None)
     parser.add_argument("--recover-missed", default="", help="Recover missed peaks for row/base/all using ProMAC candidates plus template matching.")
     parser.add_argument("--recover-iterations", type=int, default=2)
+    parser.add_argument("--recover-start", type=int, default=1, help="1-based first review row for --recover-missed all.")
+    parser.add_argument("--recover-stop", type=int, default=0, help="Inclusive last review row; zero means the final row.")
     parser.add_argument("--recover-max-multiple", type=int, default=4, choices=(2, 3, 4))
     parser.add_argument("--recover-promac-threshold", type=float, default=0.33)
     parser.add_argument("--ecg-channel", default="", help="Override ECG channel.")
@@ -897,27 +953,48 @@ def main() -> None:
     if args.recover_missed:
         rows = read_rows(review_csv)
         targets = rows if args.recover_missed.lower() == "all" else [find_row(rows, args.recover_missed)]
+        if args.recover_missed.lower() == "all":
+            first = max(1, args.recover_start)
+            last = len(rows) if args.recover_stop <= 0 else min(len(rows), args.recover_stop)
+            targets = rows[first - 1:last]
         report = []
         for row in targets:
             try:
                 editor = QrsEditor(review_csv, args.heppy_output, row, settings)
                 editor.load(use_saved=True)
+                saved = np.asarray(editor.rpeaks, dtype=int)
+                detected = detect_rpeaks(editor.signal, editor.sfreq, settings)
                 recovered, stats = recover_missing_rpeaks(
-                    editor.signal, editor.sfreq, editor.rpeaks, settings,
+                    editor.signal, editor.sfreq, detected, settings,
                     min_corr=args.auto_min_corr,
                     iterations=args.recover_iterations,
                     promac_threshold=args.recover_promac_threshold,
                     max_multiple=args.recover_max_multiple,
                 )
+                before_qc = rpeak_qc_score(saved, editor.sfreq, len(editor.signal), settings)
+                after_qc = rpeak_qc_score(recovered, editor.sfreq, len(editor.signal), settings)
+                if after_qc["valid_60s_windows"] < before_qc["valid_60s_windows"]:
+                    raise RuntimeError(
+                        f"full-record recovery reduced valid 60-s windows "
+                        f"({before_qc['valid_60s_windows']} to {after_qc['valid_60s_windows']})"
+                    )
                 _, _, save_corrected, *_ = heppy_peak_module()
                 save_corrected(editor.sidecar, recovered, editor.sfreq)
-                refined = auto_fit_row(
-                    review_csv, args.heppy_output, row, settings, args.auto_alpha,
-                    args.auto_iterations, True, True,
-                    args.auto_plot_dir or args.heppy_output / "ecg_qc" / "auto_qrs_plots",
-                    False, args.auto_min_corr, args.auto_corr_search_s, False,
+                source_counts = write_recovery_sidecar(editor.sidecar, recovered, editor.sfreq, detected, saved)
+                plot_dir = args.auto_plot_dir or args.heppy_output / "ecg_qc" / "recovery_qc_plots"
+                save_auto_qc_plot(
+                    plot_dir / f"{clean(row.get('base'))}_recovered_qrs_qc.png",
+                    editor.signal, editor.sfreq, recovered, args.auto_alpha,
+                    f"{row.get('base')} | full-record detector plus gap recovery | peaks={len(recovered)}",
                 )
-                result = {"base": clean(row.get("base")), **stats, "before": len(editor.rpeaks), "after_recovery": len(recovered), "final": refined["final_peaks"]}
+                result = {
+                    "base": clean(row.get("base")), **stats,
+                    "saved_before": len(saved), "full_record_detected": len(detected), "final": len(recovered),
+                    **{f"final_source_{key}": value for key, value in source_counts.items()},
+                    **{f"before_{key}": value for key, value in before_qc.items()},
+                    **{f"after_{key}": value for key, value in after_qc.items()},
+                    "sidecar": str(editor.sidecar),
+                }
             except Exception as exc:
                 result = {"base": clean(row.get("base")), "error": str(exc)}
             report.append(result)

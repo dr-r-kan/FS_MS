@@ -2,3 +2,5 @@ unit_test.py
 .venv/
 external/
 *.csv
+directories.txt
+options_used.json

@@ -26,6 +26,7 @@ TIME_SOURCES = {
 STATES = ("C", "E")
 METRICS = ("coverage", "mean_gfp")
 SEMIOLOGY_CONDITIONS = ("preictal", "postictal")
+BASELINE_METRICS = ("coverage_change_from_II", "mean_gfp_change_from_II")
 CONDITION_NAMES = {"preict": "preictal", "postict": "postictal"}
 SEIZURE_TYPE_NAMES = {"FS": "NEAD", "NEAD": "NEAD", "ES": "ES"}
 
@@ -186,13 +187,28 @@ def gee_results(unit: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return terms, pd.DataFrame(coefficient_rows)
 
 
+def baseline_correct_from_ii(unit: pd.DataFrame) -> pd.DataFrame:
+    keys = ["source", "participant", "group", "template_label"]
+    data = unit[unit["group"].isin(("FS", "ES"))].copy()
+    baseline = data[data["condition"].astype(str).str.upper().eq("II")][keys + list(METRICS)].rename(
+        columns={metric: f"{metric}_II" for metric in METRICS}
+    )
+    corrected = data[data["condition"].isin(SEMIOLOGY_CONDITIONS)].merge(
+        baseline, on=keys, how="inner", validate="many_to_one"
+    )
+    for metric, corrected_metric in zip(METRICS, BASELINE_METRICS):
+        corrected[f"raw_{metric}"] = corrected[metric]
+        corrected[corrected_metric] = corrected[metric] - corrected[f"{metric}_II"]
+    return corrected
+
+
 def semiology_summary(unit: pd.DataFrame) -> pd.DataFrame:
     long = unit.melt(
-        id_vars=["source", "participant", "group", "condition", "hypo_hyper", "template_label"],
-        value_vars=METRICS, var_name="metric", value_name="value",
+        id_vars=["source", "participant", "group", "condition", "template_label"],
+        value_vars=BASELINE_METRICS, var_name="metric", value_name="value",
     ).dropna(subset=["value"])
     summary = (
-        long.groupby(["source", "template_label", "metric", "hypo_hyper", "condition"])["value"]
+        long.groupby(["source", "template_label", "metric", "group", "condition"])["value"]
         .agg(n_participants="count", mean="mean", sd="std").reset_index()
     )
     summary["sem"] = summary["sd"] / np.sqrt(summary["n_participants"])
@@ -203,20 +219,17 @@ def semiology_summary(unit: pd.DataFrame) -> pd.DataFrame:
 def semiology_gee_results(unit: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     term_rows, coefficient_rows = [], []
     long = unit.melt(
-        id_vars=["source", "participant", "group", "condition", "hypo_hyper", "template_label"],
-        value_vars=METRICS, var_name="metric", value_name="value",
+        id_vars=["source", "participant", "group", "condition", "template_label"],
+        value_vars=BASELINE_METRICS, var_name="metric", value_name="value",
     ).dropna(subset=["value", "participant", "condition"])
     for (source, state, metric), data in long.groupby(["source", "template_label", "metric"]):
         prefix = {"source": source, "template_label": state, "metric": metric, "n": len(data), "n_participants": data["participant"].nunique()}
-        if data["hypo_hyper"].nunique() < 2 or data["condition"].nunique() < 2 or data["participant"].nunique() < 4:
-            term_rows.append({**prefix, "term": "", "note": "insufficient hypo/hyper, condition, or participant levels"})
+        if data["group"].nunique() < 2 or data["condition"].nunique() < 2 or data["participant"].nunique() < 4:
+            term_rows.append({**prefix, "term": "", "note": "insufficient FS/ES, condition, or participant levels"})
             continue
         try:
-            formula = "value ~ C(hypo_hyper) * C(condition)"
-            if data["group"].nunique() > 1:
-                formula += " + C(group) * C(condition)"
             fit = smf.gee(
-                formula, data=data, groups="participant",
+                "value ~ C(group) * C(condition)", data=data, groups="participant",
                 cov_struct=Exchangeable(), family=Gaussian(),
             ).fit()
             terms = fit.wald_test_terms(scalar=True).table
@@ -326,21 +339,22 @@ def plot_summary(summary: pd.DataFrame, out_file: Path) -> None:
 
 def plot_semiology(summary: pd.DataFrame, out_file: Path) -> None:
     row_keys = [(source, state) for source in SOURCES for state in STATES if ((summary["source"] == source) & (summary["template_label"] == state)).any()]
-    fig, axes = plt.subplots(len(row_keys), len(METRICS), squeeze=False, figsize=(11, 3.2 * len(row_keys)), facecolor="white")
+    fig, axes = plt.subplots(len(row_keys), len(BASELINE_METRICS), squeeze=False, figsize=(11, 3.2 * len(row_keys)), facecolor="white")
     for row, (source, state) in enumerate(row_keys):
-        for col, metric in enumerate(METRICS):
+        for col, metric in enumerate(BASELINE_METRICS):
             ax = axes[row, col]
             panel = summary[(summary["source"] == source) & (summary["template_label"] == state) & (summary["metric"] == metric)]
             conditions = [condition for condition in SEMIOLOGY_CONDITIONS if condition in set(panel["condition"])]
-            for semiology, values in panel.groupby("hypo_hyper", sort=True):
+            for group_name, values in panel.groupby("group", sort=True):
                 values = values.set_index("condition").reindex(conditions)
-                ax.errorbar(conditions, values["mean"], yerr=values["ci95"], marker="o", capsize=3, label=str(semiology))
-            ax.set_title(f"{source.title()} backfit | state {state} | {'Coverage' if metric == 'coverage' else 'Mean GFP'}")
+                ax.errorbar(conditions, values["mean"], yerr=values["ci95"], marker="o", capsize=3, label=str(group_name))
+            ax.axhline(0, color="black", linewidth=0.8)
+            ax.set_title(f"{source.title()} backfit | state {state} | {'Coverage' if metric.startswith('coverage') else 'Mean GFP'}")
             ax.set_xlabel("Condition")
-            ax.set_ylabel("Proportion" if metric == "coverage" else "GFP (native units)")
+            ax.set_ylabel("Change from individual II baseline")
             ax.grid(axis="y", alpha=0.2)
-            ax.legend(title="Semiology", frameon=False)
-    fig.suptitle("Microstates C and E: hypo/hyper semiology × condition", fontweight="bold")
+            ax.legend(title="Group", frameon=False)
+    fig.suptitle("Microstates C and E: FS vs ES change from individual II baseline", fontweight="bold")
     fig.tight_layout()
     fig.savefig(out_file, dpi=300, facecolor="white")
     plt.close(fig)
@@ -381,12 +395,8 @@ def analyse(results_dir: Path, out_dir: Path, method: str = "hard", manifest_csv
     coefficients.to_csv(out_dir / "ce_group_condition_gee_coefficients.csv", index=False)
     plot_summary(summary, out_dir / "ce_group_condition.png")
 
-    semiology_data = backfits[
-        backfits["condition"].isin(SEMIOLOGY_CONDITIONS)
-        & backfits["hypo_hyper"].isin(("hypo", "hyper"))
-    ]
-    if not semiology_data.empty:
-        semiology_unit = participant_condition_metrics(semiology_data, ("hypo_hyper",))
+    semiology_unit = baseline_correct_from_ii(unit)
+    if not semiology_unit.empty:
         semiology_descriptives = semiology_summary(semiology_unit)
         semiology_terms, semiology_coefficients = semiology_gee_results(semiology_unit)
         semiology_unit.to_csv(out_dir / "ce_semiology_participant_condition_metrics.csv", index=False)
@@ -394,7 +404,7 @@ def analyse(results_dir: Path, out_dir: Path, method: str = "hard", manifest_csv
         semiology_terms.to_csv(out_dir / "ce_semiology_gee_terms.csv", index=False)
         semiology_coefficients.to_csv(out_dir / "ce_semiology_gee_coefficients.csv", index=False)
         (
-            semiology_unit.groupby(["source", "condition", "hypo_hyper"])["participant"]
+            semiology_unit.groupby(["source", "condition", "group"])["participant"]
             .nunique().rename("n_participants").reset_index()
             .to_csv(out_dir / "ce_semiology_condition_counts.csv", index=False)
         )
@@ -420,7 +430,7 @@ def self_check() -> None:
         for participant_index, participant in enumerate(participants):
             group = "FS" if participant_index < 8 else "ES"
             semiology = "hypo" if participant_index % 2 == 0 else "hyper"
-            for condition_index, condition in enumerate(SEMIOLOGY_CONDITIONS):
+            for condition_index, condition in enumerate(("II", *SEMIOLOGY_CONDITIONS)):
                 file_path = str(root / f"{participant}_{condition}.mat")
                 manifest_rows.append({"file_path": file_path, "hypo_hyper": semiology})
                 for state_index, state in enumerate(STATES):
@@ -459,7 +469,9 @@ def self_check() -> None:
         assert set(terms["template_label"]) == set(STATES)
         assert (root / "analysis" / "ce_group_condition.png").exists()
         semiology_terms = pd.read_csv(root / "analysis" / "ce_semiology_gee_terms.csv")
-        assert semiology_terms["term"].str.contains("hypo_hyper", na=False).any()
+        assert semiology_terms["term"].str.contains(r"C\(group\)", na=False).any()
+        semiology_unit = pd.read_csv(root / "analysis" / "ce_semiology_participant_condition_metrics.csv")
+        assert set(BASELINE_METRICS).issubset(semiology_unit.columns)
         assert (root / "analysis" / "ce_semiology_by_condition.png").exists()
         gradient_terms = pd.read_csv(root / "analysis" / "ce_preictal_gradient_gee_terms.csv")
         assert gradient_terms["term"].str.contains("minutes_to_ictus", na=False).any()

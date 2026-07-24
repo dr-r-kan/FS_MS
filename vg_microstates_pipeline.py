@@ -113,6 +113,7 @@ def build_jobs(
     jobs: list[dict] = []
     pending: list[dict] = []
     skipped: list[dict] = []
+    used_paths: set[Path] = set()
 
     for i, row in enumerate(snip_rows, start=1):
         segment = clean(row.get("segment"))
@@ -137,7 +138,15 @@ def build_jobs(
         source_row = safe(row.get("source_row"))
         event = safe(row.get("event_number"))
         seg = safe(row.get("segment_number")) if clean(row.get("segment_number")) else f"{i:05d}"
-        out_file = segment_dir / f"{safe(patient)}_{condition}_row{source_row}_event{event}_seg{seg}.fif"
+        stem = f"{safe(patient)}_{condition}_row{source_row}_event{event}_seg{seg}"
+        out_file = segment_dir / f"{stem}.fif"
+        if out_file in used_paths:
+            start = safe(row.get("output_start_seconds"))
+            end = safe(row.get("output_end_seconds"))
+            out_file = segment_dir / f"{stem}_crop{start}-{end}.fif"
+        if out_file in used_paths:
+            out_file = segment_dir / f"{stem}_crop{start}-{end}_row{i:05d}.fif"
+        used_paths.add(out_file)
         jobs.append(
             {
                 "participant": patient,
@@ -162,6 +171,9 @@ def build_jobs(
                 "source_migrated_edf_path": clean(row.get("source_migrated_edf_path")),
             }
         )
+    paths = [job["file_path"] for job in jobs]
+    if len(paths) != len(set(paths)):
+        raise ValueError("Segment output paths are not unique")
     return jobs, pending, skipped
 
 
@@ -254,17 +266,20 @@ def self_check() -> None:
         raw = root / "raw.fif"
         raw.write_text("placeholder", encoding="utf-8")
         snips = [
-            {"patient_code": "P1", "patient_id": "1", "output_edf": "P1_snips.edf", "segment": "preictal", "output_start_seconds": "0", "output_end_seconds": "20", "source": "s", "source_sheet": "sh", "source_row": "7", "event_type": "Ict", "event_number": "2", "segment_number": ""},
+            {"patient_code": "P1", "patient_id": "1", "output_edf": "P1_snips.edf", "segment": "preictal", "output_start_seconds": "0", "output_end_seconds": "20", "source": "s", "source_sheet": "sh", "source_row": "7", "event_type": "Ict", "event_number": "2", "segment_number": "2"},
             {"patient_code": "P1", "patient_id": "1", "output_edf": "P1_snips.edf", "segment": "ictal", "output_start_seconds": "20", "output_end_seconds": "21", "source_row": "7", "event_type": "Ict", "event_number": "2"},
+            {"patient_code": "P1", "patient_id": "1", "output_edf": "P1_snips.edf", "segment": "preictal", "output_start_seconds": "30", "output_end_seconds": "50", "source": "s", "source_sheet": "sh", "source_row": "7", "event_type": "Ict", "event_number": "2", "segment_number": "2"},
         ]
         reviews = [{"base": "P1_snips", "raw_fif": str(raw), "raw_fif_keep": ""}]
         db = [{"patient_code": "P1", "source": "s", "source_sheet": "sh", "source_row": "7", "event_type": "Ict", "event_number": "2", "patient_type": "FS", "hypo_hyper": "hypo"}]
         jobs, pending, skipped = build_jobs(snips, reviews, db, "remove", root / "segments")
-        assert len(jobs) == 2
+        assert len(jobs) == 3
         assert jobs[0]["condition"] == "preict"
         assert jobs[1]["condition"] == "ictal"
         assert jobs[0]["group"] == "FS"
         assert jobs[0]["hypo_hyper"] == "hypo"
+        assert len({job["file_path"] for job in jobs}) == 3
+        assert "_crop30-50" in jobs[2]["file_path"]
         assert not pending
         assert not skipped
 

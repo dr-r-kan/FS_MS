@@ -1,0 +1,59 @@
+{
+  "filters": {
+    "hp": 0.5,
+    "lp": 45.0,
+    "line_freqs": [
+      50.0,
+      100.0
+    ]
+  },
+  "ecg": {
+    "channel": "",
+    "flip_on_load": false
+  },
+  "montage": {
+    "name": "standard_1020",
+    "rename_to_1020": true
+  },
+  "pyprep": true,
+  "asr": false,
+  "ica_iclabel": true,
+  "cfa_mode": "both",
+  "adaptive_rr": {
+    "rr_min_bpm": 35.0,
+    "rr_max_bpm": 140.0,
+    "rr_outlier_mad": 3.5,
+    "bpm_smooth_win": 5
+  },
+  "epoch": {
+    "tmin": -0.2,
+    "tmax": 0.6,
+    "baseline": null,
+    "amp_reject_uv": 150.0,
+    "rr_z_reject": 3.5
+  },
+  "export": {
+    "fif": true,
+    "eeglab": false
+  },
+  "hrv": {
+    "compute": true,
+    "time_domain": true,
+    "frequency_domain": true,
+    "nonlinear": false
+  },
+  "spirometry": {
+    "channel": ""
+  },
+  "stim_keep": [],
+  "remove_cfa_mode": "both",
+  "flip_flags": false,
+  "preprocessing_tuning": {
+    "pyprep_channel_wise": false,
+    "pyprep_max_chunk_size": 8,
+    "pyprep_by_segment": true,
+    "pyprep_safe_quantile_patch": true,
+    "ica_fit_hz": 100.0,
+    "iclabel_backend": "auto"
+  }
+}
