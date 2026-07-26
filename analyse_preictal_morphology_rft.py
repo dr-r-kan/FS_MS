@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -288,6 +289,14 @@ def run_analysis(morphology_csv: Path, positions_csv: Path, manifest_csv: Path, 
     morphology["file_key"] = norm_path(morphology["file_path"])
     morphology = morphology.merge(manifest[["file_key", "stratum"]], on="file_key", how="left", validate="many_to_one")
     morphology["template_label"] = morphology["template_label"].astype(str).str.upper()
+    label_pairs = morphology[["prior_state_index", "template_label"]].drop_duplicates()
+    label_counts = label_pairs.groupby("prior_state_index", observed=True)["template_label"].nunique()
+    if set(pd.to_numeric(label_pairs["prior_state_index"], errors="raise").astype(int)) != set(range(1, 7)) or not label_counts.eq(1).all():
+        raise ValueError("Window-refit CSV does not contain one unambiguous manual label for each prior state 1..6")
+    labels_by_prior_state = {
+        str(int(row.prior_state_index)): str(row.template_label)
+        for row in label_pairs.sort_values("prior_state_index").itertuples(index=False)
+    }
     window_export = morphology.assign(subject_id=morphology["participant"].map(subject_map),
                                       event_id=morphology["file_path"].map(event_map)).drop(
                                           columns=["participant", "file_path", "file_key"])
@@ -482,7 +491,12 @@ def run_analysis(morphology_csv: Path, positions_csv: Path, manifest_csv: Path, 
         ("p_tfce_fwer", "probability", "Two-sided maximum-TFCE permutation p-value, jointly corrected over electrodes and fields."),
     ], columns=["variable", "unit_or_type", "description"])
     variables.sort_values("variable").to_csv(variable_path, index=False)
-    summary = {"participants": int(betas["participant"].nunique()), "participant_beta_rows": len(betas),
+    with morphology_csv.open("rb") as source_handle:
+        source_morphology_csv_sha256 = hashlib.file_digest(source_handle, "sha256").hexdigest()
+    summary = {"labels_by_prior_state": labels_by_prior_state,
+               "source_morphology_csv": str(morphology_csv.resolve()),
+               "source_morphology_csv_sha256": source_morphology_csv_sha256,
+               "participants": int(betas["participant"].nunique()), "participant_beta_rows": len(betas),
                "window_refit_rows": window_refit_rows, "successful_window_refit_rows": successful_window_refit_rows,
                "window_refit_events": window_refit_events, "window_refit_status_counts": window_refit_status_counts,
                "event_beta_rows": len(event_betas),

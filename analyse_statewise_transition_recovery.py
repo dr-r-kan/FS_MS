@@ -58,6 +58,21 @@ def state_metrics(counts: np.ndarray, b0: np.ndarray, ii_n: np.ndarray,
     return rows
 
 
+def allstate_metrics(counts: np.ndarray, b0: np.ndarray, ii_n: np.ndarray, minimum_total: int = 60) -> dict:
+    origins = tuple(range(6))
+    observed = int(counts.sum())
+    enough = observed >= minimum_total and int(ii_n.sum()) >= minimum_total
+    log_kappa, _ = ace.fit_kappa(counts, b0, origins, minimum_total) if enough else (np.nan, observed)
+    return {
+        "log_kappa_all": log_kappa,
+        "kappa_all": math.exp(log_kappa) if np.isfinite(log_kappa) else np.nan,
+        "abs_log_kappa_all": abs(log_kappa) if np.isfinite(log_kappa) else np.nan,
+        "js_all_from_II": ace.js_divergence(counts, b0, origins) if enough else np.nan,
+        "all_outgoing_transitions": observed,
+        "ii_all_outgoing_transitions": int(ii_n.sum()),
+    }
+
+
 def preictal_metrics(results_dir: Path, manifest: pd.DataFrame, labels: tuple[str, ...],
                      baselines: dict[str, tuple[np.ndarray, np.ndarray]], minimum: int):
     columns = ["participant", "file_path", "backfit_method", "template_label", "bin_from_ictus", "collapsed_sequence"]
@@ -65,7 +80,7 @@ def preictal_metrics(results_dir: Path, manifest: pd.DataFrame, labels: tuple[st
     table = table[table["backfit_method"].eq("hard") & table["template_label"].eq(labels[0])].copy()
     table["file_key"] = table["file_path"].astype(str).str.replace("/", "\\", regex=False).str.lower()
     table = table.merge(manifest[["file_key", "stratum", "hypo_hyper"]], on="file_key", how="left", validate="many_to_one")
-    windows, late = [], []
+    windows, late, all_windows, all_late = [], [], [], []
     for (participant, file_path), frame in table.groupby(["participant", "file_path"], observed=True, sort=False):
         baseline = baselines.get(str(participant))
         if baseline is None:
@@ -84,24 +99,27 @@ def preictal_metrics(results_dir: Path, manifest: pd.DataFrame, labels: tuple[st
                     "hypo_hyper": info.hypo_hyper, "phase": "preictal_60s",
                     "window_end_to_ictus_s": (start - 1) * 10, "minutes_to_ictus": -(start - 1) / 6}
             windows.extend(meta | row for row in state_metrics(counts, b0, ii_n, labels, minimum))
+            all_windows.append(meta | allstate_metrics(counts, b0, ii_n))
         late_bins = list(range(30, 0, -1))
         if all(value in sequences for value in late_bins):
             counts = ace.transition_counts(ace.collapse([state for value in late_bins for state in sequences[value]]))
             meta = {"participant": participant, "file_path": file_path, "stratum": info.stratum,
                     "hypo_hyper": info.hypo_hyper, "phase": "late_preictal_5min"}
             late.extend(meta | row for row in state_metrics(counts, b0, ii_n, labels, minimum))
-    return ace.add_cohort(pd.DataFrame(windows)), ace.add_cohort(pd.DataFrame(late))
+            all_late.append(meta | allstate_metrics(counts, b0, ii_n))
+    return (ace.add_cohort(pd.DataFrame(windows)), ace.add_cohort(pd.DataFrame(late)),
+            ace.add_cohort(pd.DataFrame(all_windows)), ace.add_cohort(pd.DataFrame(all_late)))
 
 
 def postictal_metrics(results_dir: Path, manifest: pd.DataFrame, labels: tuple[str, ...],
-                      baselines: dict[str, tuple[np.ndarray, np.ndarray]], minimum: int) -> pd.DataFrame:
+                      baselines: dict[str, tuple[np.ndarray, np.ndarray]], minimum: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     columns = ["participant", "condition", "file_path", "backfit_method", "valid_samples", "sfreq",
                "state_from_index", "state_to_index", "transition_count"]
     table = pd.read_csv(results_dir / "participant_condition_transition_metrics.csv", usecols=columns)
     table = table[table["condition"].astype(str).str.lower().eq("postict") & table["backfit_method"].eq("hard")].copy()
     table["file_key"] = table["file_path"].astype(str).str.replace("/", "\\", regex=False).str.lower()
     table = table.merge(manifest[["file_key", "stratum", "hypo_hyper"]], on="file_key", how="left", validate="many_to_one")
-    rows = []
+    rows, all_rows = [], []
     for (participant, file_path), frame in table.groupby(["participant", "file_path"], observed=True, sort=False):
         baseline = baselines.get(str(participant))
         if baseline is None:
@@ -113,7 +131,8 @@ def postictal_metrics(results_dir: Path, manifest: pd.DataFrame, labels: tuple[s
         meta = {"participant": participant, "file_path": file_path, "stratum": info.stratum,
                 "hypo_hyper": info.hypo_hyper, "phase": "postictal_full_record", "duration_s": duration}
         rows.extend(meta | row for row in state_metrics(counts, b0, ii_n, labels, minimum))
-    return ace.add_cohort(pd.DataFrame(rows))
+        all_rows.append(meta | allstate_metrics(counts, b0, ii_n))
+    return ace.add_cohort(pd.DataFrame(rows)), ace.add_cohort(pd.DataFrame(all_rows))
 
 
 def interaction_term(parameters, prefix: str) -> str:
@@ -189,6 +208,9 @@ def self_check() -> None:
     b0 = np.full((6, 6), 0.2); np.fill_diagonal(b0, 0)
     metrics = state_metrics(counts, b0, np.full(6, 20), labels, 5)
     assert len(metrics) == 6 and metrics[4]["outgoing_transitions"] == 10
+    all_counts = np.ones((6, 6)); np.fill_diagonal(all_counts, 0)
+    pooled = allstate_metrics(all_counts, b0, np.full(6, 20), 5)
+    assert np.isfinite(pooled["log_kappa_all"]) and pooled["all_outgoing_transitions"] > 0
 
 
 def main() -> None:
@@ -210,8 +232,10 @@ def main() -> None:
         raise ValueError("Manifest file paths are not unique")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     baselines = interictal_baselines(args.results_dir / "participant_condition_transition_metrics.csv")
-    windows, late = preictal_metrics(args.results_dir, manifest, labels, baselines, args.minimum_transitions)
-    postictal = postictal_metrics(args.results_dir, manifest, labels, baselines, args.minimum_transitions)
+    windows, late, all_windows, all_late = preictal_metrics(
+        args.results_dir, manifest, labels, baselines, args.minimum_transitions)
+    postictal, all_postictal = postictal_metrics(
+        args.results_dir, manifest, labels, baselines, args.minimum_transitions)
     preictal_participant, preictal_contrasts = preictal_models(windows)
     recovery_participant, recovery_contrasts, recovery_descriptive = recovery_models(late, postictal)
     outputs = {
@@ -222,6 +246,8 @@ def main() -> None:
         "statewise_recovery_participant.csv": recovery_participant,
         "statewise_recovery_gee_contrasts.csv": recovery_contrasts,
         "statewise_recovery_descriptives.csv": recovery_descriptive,
+        "allstate_preictal_transition_windows.csv": all_windows,
+        "allstate_recovery_event_phases.csv": pd.concat([all_late, all_postictal], ignore_index=True, sort=False),
     }
     for name, frame in outputs.items():
         frame.to_csv(args.out_dir / name, index=False)
@@ -230,6 +256,7 @@ def main() -> None:
                "preictal_events": int(windows["file_path"].nunique()),
                "postictal_records": int(postictal["file_path"].nunique()),
                "postictal_estimand": "whole-record postictal operator versus final-five-minute preictal operator",
+               "allstate_estimand": "single maximum-likelihood kappa across all six origins and transition-count-weighted JS across all six origin distributions",
                "microstate_refitting_performed": False}
     (args.out_dir / "statewise_transition_recovery_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))

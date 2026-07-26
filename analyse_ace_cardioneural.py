@@ -414,15 +414,18 @@ def baseline_correct_hr(windows: pd.DataFrame) -> pd.DataFrame:
                 .groupby(keys, observed=True)["mean_hr_bpm"]
                 .agg(baseline_hr_bpm="mean", baseline_hr_valid_windows="size").reset_index())
     out = windows.merge(baseline, on=keys, how="left", validate="many_to_one")
-    out["baseline_hr_expected_windows"] = 15
+    out["baseline_hr_expected_windows"] = int(windows.loc[
+        windows["minutes_to_ictus"].between(-20, -5, inclusive="both"), "window_end_to_ictus_s"].nunique())
     out["baseline_hr_valid_fraction"] = out["baseline_hr_valid_windows"] / out["baseline_hr_expected_windows"]
     out["delta_hr_bpm"] = out["mean_hr_bpm"] - out["baseline_hr_bpm"]
     return out
 
 
-def cardiac_windows(manifest: pd.DataFrame, ecg_qc_dir: Path, original_ecg_qc_dir: Path) -> pd.DataFrame:
+def cardiac_windows(manifest: pd.DataFrame, ecg_qc_dir: Path, original_ecg_qc_dir: Path,
+                    strata: tuple[str, ...] = FUNCTIONAL, window_length_s: int = 60,
+                    step_s: int = 60) -> pd.DataFrame:
     rows = []
-    events = manifest[manifest["condition"].astype(str).str.lower().eq("preict") & manifest["stratum"].isin(FUNCTIONAL)]
+    events = manifest[manifest["condition"].astype(str).str.lower().eq("preict") & manifest["stratum"].isin(strata)]
     for event in events.itertuples(index=False):
         final, recovered = read_rpeaks_with_recovery_flags(rpeak_file(ecg_qc_dir, event.source_raw_fif))
         start, stop = float(event.crop_start_seconds), float(event.crop_end_seconds)
@@ -435,10 +438,10 @@ def cardiac_windows(manifest: pd.DataFrame, ecg_qc_dir: Path, original_ecg_qc_di
         rr = np.diff(peaks)
         mids = (peaks[:-1] + peaks[1:]) / 2
         interval_recovered = flags[:-1] | flags[1:]
-        for end_to in range(0, 1200 - 60 + 1, 60):
-            lo, hi = onset - end_to - 60, onset - end_to
+        for end_to in range(0, 1200 - window_length_s + 1, step_s):
+            lo, hi = onset - end_to - window_length_s, onset - end_to
             overlap = np.maximum(0, np.minimum(peaks[1:], hi) - np.maximum(peaks[:-1], lo))
-            coverage = overlap.sum() / 60
+            coverage = overlap.sum() / window_length_s
             included = overlap > 0
             gaps = rr[included]
             hr = 60 / rr[included]
@@ -449,6 +452,7 @@ def cardiac_windows(manifest: pd.DataFrame, ecg_qc_dir: Path, original_ecg_qc_di
                          "hypo_hyper": event.hypo_hyper, "source_raw_fif": event.source_raw_fif,
                          "rpeak_sidecar": str(rpeak_file(ecg_qc_dir, event.source_raw_fif)),
                          "window_end_to_ictus_s": end_to, "minutes_to_ictus": -end_to / 60,
+                         "window_length_s": window_length_s, "step_s": step_s,
                          "mean_hr_bpm_raw": float(np.average(hr, weights=overlap[included])) if included.any() else np.nan,
                          "rr_coverage": coverage, "max_rr_gap_s": float(np.max(gaps)) if len(gaps) else np.nan,
                          "recovered_interval_fraction": recovered_fraction, "n_rr_intervals": int(included.sum()),
@@ -568,7 +572,9 @@ def self_check() -> None:
     p = pd.Series([.01, .04, .03])
     assert np.all(holm(p).between(0, 1)) and np.all(bh(p).between(0, 1))
     hr = pd.DataFrame({"participant": ["p"] * 4, "file_path": ["f"] * 4,
-                       "minutes_to_ictus": [-19., -10., -5., 0.], "mean_hr_bpm": [60., 70., 80., 90.]})
+                       "minutes_to_ictus": [-19., -10., -5., 0.],
+                       "window_end_to_ictus_s": [1140, 600, 300, 0],
+                       "mean_hr_bpm": [60., 70., 80., 90.]})
     corrected = baseline_correct_hr(hr)
     assert corrected["baseline_hr_bpm"].eq(70).all() and corrected.loc[3, "delta_hr_bpm"] == 20
 
