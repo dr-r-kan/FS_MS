@@ -1,0 +1,46 @@
+# Local dependencies and datasets
+Koenig_code/
+test_sets/
+data/
+raw_data/
+derivatives/
+conditioned_sets.csv
+
+# Generated outputs
+outputs/
+Output/
+examples/
+hierarchical_microstates/
+hierarchical_alignment_diagnostic*/
+meta_microstate_output/
+*.json
+*.mat
+*.csv
+*.png
+!config/*.json
+!README.md
+
+# EEG binary/data files
+*.set
+*.fdt
+!MetaMaps_2023_06.set
+
+# MATLAB/editor/OS artifacts
+*.asv
+*.m~
+*.mlx.autosave
+*.pyc
+__pycache__/
+.DS_Store
+.vscode/
+/.idea/
+.agents/
+.codex/
+.idea/
+.venv/
+venv/
+
+# Legacy scratch folders
+NotNeeded/
+old/
+cardiac_cycle_and_microstates/

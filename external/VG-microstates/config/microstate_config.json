@@ -1,0 +1,86 @@
+{
+  "paths": {
+    "template_file": "MetaMaps_2023_06.set",
+    "single_json_dir": "outputs/json",
+    "single_plot_dir": "outputs/plots",
+    "hierarchical_output_dir": "outputs/hierarchical_microstates",
+    "simulation_output_dir": "outputs/simulations",
+    "diagnostic_output_dir": "outputs/diagnostics",
+    "koenig_code_dir": "_internal/matlab/Koenig_code",
+    "spm_mixture_paths": [
+      "~/spm/toolbox/mixture",
+      "~/Downloads/spm/toolbox/mixture"
+    ]
+  },
+  "preprocessing": {
+    "apply_average_reference": true,
+    "filter_band": [2, 20],
+    "spatial_filter": "smoothing",
+    "spatial_filter_neighbours": 12,
+    "spatial_filter_strength": 0.75,
+    "reject_gfp_peak_outliers": true,
+    "gfp_outlier_mad_multiplier": 3
+  },
+  "single_file": {
+    "method": "spm_vb",
+    "criterion": "",
+    "K_candidates": [2, 3, 4, 5, 6, 7, 8, 9, 10],
+    "align_template": true,
+    "use_scalp_channels": true,
+    "save_json": true
+  },
+  "hierarchical": {
+    "K_candidates": [4, 5, 6, 7],
+    "criterion": "free_energy_elbow",
+    "use_template_initialisation": true,
+    "canonical_reporting_template_K": [],
+    "canonical_prior_weight_global": 75,
+    "prior_weight_group": 25,
+    "prior_weight_condition": 25,
+    "prior_weight_participant": 25,
+    "prior_weight_file": 50,
+    "spm_prior_weight": 1,
+    "reject_template_misaligned_peaks": true,
+    "template_peak_min_abs_corr": 0.65,
+    "template_peak_template_K": 7,
+    "min_peak_count_after_template_rejection": 50,
+    "max_maps_per_file": 1500,
+    "max_global_maps": 50000,
+    "max_child_maps": 50000,
+    "require_spm_initialisation": true
+  },
+  "simulation": {
+    "out_dir": "outputs/simulations",
+    "reps": 10,
+    "K_true_vals": [4, 5, 6, 7],
+    "SNR_dbs": [-6, -4, -2, 0, 2, 4, 6],
+    "K_candidates": [2, 3, 4, 5, 6, 7, 8, 9, 10],
+    "duration_s": 300,
+    "sfreq": 250,
+    "n_workers": 10,
+    "montages": ["full", "10-20-20", "10-20-12"],
+    "overlap_probs": [0, 0.5],
+    "overlap_ms_range": [10, 40],
+    "overlap_strength": 0.5,
+    "compute_backfit_diagnostics": true,
+    "save_backfit_details": true,
+    "template_alignment_strong_threshold": 0.5,
+    "ecological_profile": true,
+    "clean_sanity_profile": true,
+    "clean_sanity_snr_db_threshold": 40,
+    "validate_simulation": false,
+    "preprocessing": {
+      "apply_average_reference": true,
+      "spatial_filter": "none",
+      "reject_gfp_peak_outliers": true
+    }
+  },
+  "plotting": {
+    "display_normalisation": "zscore",
+    "maplimits": "global_percentile",
+    "map_percentile": 75,
+    "colormap_name": "jet",
+    "electrodes": "off",
+    "resolution": 300
+  }
+}

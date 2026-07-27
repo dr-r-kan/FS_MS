@@ -1,6 +1,0 @@
-[submodule "external/HEPPy"]
-	path = external/HEPPy
-	url = https://github.com/ClinicalAffectiveNeuroscienceLab/HEPPy.git
-[submodule "external/VG-microstates"]
-	path = external/VG-microstates
-	url = https://github.com/ClinicalAffectiveNeuroscienceLab/VG-microstates.git

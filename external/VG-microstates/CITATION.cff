@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using this metadata."
+title: "SPM Microstate Analysis"
+authors:
+  - family-names: "Kandasamy"
+    given-names: "Rohan"
+license: "MIT"
+repository-code: "https://github.com/dr-r-kan/SeizureMicrostateBehaviour"
+date-released: "2026-05-26"
