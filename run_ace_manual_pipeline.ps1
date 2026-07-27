@@ -9,7 +9,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Python = Join-Path $Repo '.venv\Scripts\python.exe'
-$EcgQc = 'G:\FS_microstates_study\heppy_output_spmms_final\ecg_qc'
+$EcgQc = 'G:\FS_microstates_study\heppy_output_spmms_20260724\ecg_qc'
 $OriginalEcgQc = 'G:\FS_microstates_study\heppy_output\ecg_qc'
 $Demographics = Join-Path $Repo 'analysis_database.csv'
 $PeakWindows = Join-Path $Analysis 'data\directional_peak_backfit_windows.csv'
@@ -104,7 +104,12 @@ try {
     }
 
     Invoke-Stage 'focused_analysis' @($Summary,(Join-Path $Analysis 'RESULTS.md'),(Join-Path $Analysis 'AUDIT.txt'),
-        (Join-Path $Analysis 'data\ecg_cache_schema.json'),(Join-Path $Analysis 'data\analysis_schema.json')) {
+        (Join-Path $Analysis 'data\ecg_cache_schema.json'),(Join-Path $Analysis 'data\analysis_schema.json'),
+        (Join-Path $Analysis 'figures\preictal_kappa_vs_js.png'),
+        (Join-Path $Analysis 'figures\c_origin_final_minute_boxplots.png'),
+        (Join-Path $Analysis 'figures\c_origin_js_recovery_boxplots.png'),
+        (Join-Path $Analysis 'figures\fs_cpi_kappa_regression.png'),
+        (Join-Path $Analysis 'figures\fs_csi_to_c_regression.png')) {
         & $Python -B analyse_focused_fs_ms.py --results-dir $Results --manifest $Manifest `
             --ecg-qc-dir $EcgQc --original-ecg-qc-dir $OriginalEcgQc --demographics-csv $Demographics `
             --peak-windows-csv $PeakWindows --out-dir $Analysis --reuse-ecg

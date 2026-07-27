@@ -9,13 +9,13 @@ echo At that prompt, inspect the opened topography image, enter six labels in St
 echo confirm them, and leave this terminal open. The pipeline will then continue automatically.
 echo.
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0run_ace_manual_pipeline.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0run_ace_manual_pipeline.ps1" %*
 set "FSMS_EXIT=%ERRORLEVEL%"
 
 echo.
 if not "%FSMS_EXIT%"=="0" (
     echo FS_MS pipeline FAILED with exit code %FSMS_EXIT%.
-    echo Review pipeline_run.log and pipeline_audit.json in focused_analysis_20260726.
+    echo Review pipeline_run.log and pipeline_audit.json in the Analysis directory.
 ) else (
     echo FS_MS pipeline completed successfully.
 )

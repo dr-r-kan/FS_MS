@@ -1,6 +1,0 @@
-working_directory,G:\FS_microstates_study
-clip_folder,G:\FS_microstates_study\clips
-raw_1,G:\Chalfont
-raw_2,E:\EEGs\Anon NHNN\EDFs\All
-map1,F:\Chalfont\FS_DD_ES_Database_5_11_2024.xlsx
-map2,E:\EEGs\Anon NHNN\EDFs\MetaEventMap.xlsx
