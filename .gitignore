@@ -4,3 +4,6 @@ unit_test.py
 directories.txt
 options_used.json
 OLD/
+build_analysis_database.py
+.cache/
+__pycache__/

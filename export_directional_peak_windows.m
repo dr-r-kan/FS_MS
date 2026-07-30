@@ -4,8 +4,7 @@ function summary = export_directional_peak_windows(results_dir, manifest_csv, ou
 % This does not refit microstates. It applies each participant's manually
 % aligned K=6 solution to cached GFP-peak maps and exports non-overlapping
 % 60-second state/transition counts for preictal and genuine interictal
-% records. The output supports an estimator-matched interictal sensitivity
-% analysis of cardioneural predictive coupling.
+% records, plus the first postictal minute for equal-duration recovery.
 
 arguments
     results_dir (1,1) string
@@ -17,8 +16,9 @@ labels = ["F", "E", "G", "B", "A", "C"];
 manifest = readtable(manifest_csv, TextType="string");
 manifest.manifest_index = (1:height(manifest))';
 condition = lower(strtrim(manifest.condition));
-manifest = manifest(condition == "ii" | condition == "preict", :);
-manifest.condition_key = condition(condition == "ii" | condition == "preict");
+keep_condition = condition == "ii" | condition == "preict" | condition == "postict";
+manifest = manifest(keep_condition, :);
+manifest.condition_key = condition(keep_condition);
 
 variables = ["participant", "file_path", "condition", "group", "seizure_type", ...
     "hypo_hyper", "window_index", "window_start_s", "window_end_s", ...
@@ -75,7 +75,7 @@ for p = 1:numel(participants)
                 rows(end + 1, :) = make_row(record, w, start, stop, endpoint, ...
                     peak_time, state, labels); %#ok<AGROW>
             end
-        else
+        elseif record.condition_key == "ii"
             starts = 0:60:(floor(duration / 60) * 60 - 60);
             for w = 1:numel(starts)
                 start = starts(w);
@@ -83,6 +83,9 @@ for p = 1:numel(participants)
                 rows(end + 1, :) = make_row(record, w, start, stop, NaN, ...
                     peak_time, state, labels); %#ok<AGROW>
             end
+        elseif duration >= 60
+            rows(end + 1, :) = make_row(record, 1, 0, 60, NaN, ...
+                peak_time, state, labels); %#ok<AGROW>
         end
         records_done = records_done + 1;
         if mod(records_done, 50) == 0
