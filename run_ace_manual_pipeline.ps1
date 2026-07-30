@@ -5,22 +5,23 @@ param(
     [string]$Results = 'G:\FS_microstates_study\vg_microstates\focused_hierarchy_final',
     [string]$Analysis = 'G:\FS_microstates_study\vg_microstates\focused_analysis_final',
     [string]$OptimisedAnalysis = '',
+    [string]$PublicationAnalysis = '',
     [string[]]$ManualLabels = @()
 )
 
 $OptimisedAnalysis = if ($OptimisedAnalysis) { $OptimisedAnalysis } else { Join-Path $Analysis 'optimised' }
+$PublicationAnalysis = if ($PublicationAnalysis) { $PublicationAnalysis } else { Join-Path (Split-Path -Parent $Analysis) 'publication_final' }
 $ErrorActionPreference = 'Stop'
 $Python = Join-Path $Repo '.venv\Scripts\python.exe'
 $EcgQc = 'G:\FS_microstates_study\heppy_output_spmms_20260724\ecg_qc'
 $OriginalEcgQc = 'G:\FS_microstates_study\heppy_output\ecg_qc'
 $Demographics = Join-Path $Repo 'analysis_database.csv'
 $PeakWindows = Join-Path $Analysis 'data\directional_peak_backfit_windows.csv'
-$Summary = Join-Path $Analysis 'data\summary.json'
 $Audit = Join-Path $Analysis 'pipeline_audit.json'
 $Log = Join-Path $Analysis 'pipeline_run.log'
 $Mutex = [System.Threading.Mutex]::new($false, 'Global\FSMS_FOCUSED_PIPELINE')
 $HasMutex = $false
-$State = [ordered]@{started_utc=[DateTime]::UtcNow.ToString('o'); results=$Results; analysis=$Analysis; optimised_analysis=$OptimisedAnalysis; stages=[ordered]@{}}
+$State = [ordered]@{started_utc=[DateTime]::UtcNow.ToString('o'); results=$Results; analysis=$Analysis; optimised_analysis=$OptimisedAnalysis; publication_analysis=$PublicationAnalysis; stages=[ordered]@{}}
 
 function Test-Outputs([string[]]$Paths) {
     foreach ($Path in $Paths) {
@@ -45,7 +46,7 @@ function Invoke-Stage([string]$Name, [string[]]$Outputs, [scriptblock]$Action, [
 function Quote-Matlab([string]$Value) { $Value.Replace("'", "''") }
 
 try {
-    New-Item -ItemType Directory -Force -Path $Results, $Analysis, $OptimisedAnalysis, (Join-Path $Analysis 'data'), (Join-Path $Analysis 'figures') | Out-Null
+    New-Item -ItemType Directory -Force -Path $Results, $Analysis, $OptimisedAnalysis, (Join-Path $Analysis 'data') | Out-Null
     Start-Transcript -LiteralPath $Log -Append | Out-Null
     try { $HasMutex = $Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasMutex = $true }
     if (-not $HasMutex) { throw 'Another focused FS_MS pipeline is running.' }
@@ -58,9 +59,9 @@ try {
     Invoke-Stage 'self_checks' @((Join-Path $Analysis 'self_checks.ok')) {
         & $Python -B analyse_focused_fs_ms.py --self-check
         if ($LASTEXITCODE -ne 0) { return }
-        & $Python -B plot_focused_fs_ms.py --self-check
-        if ($LASTEXITCODE -ne 0) { return }
         & $Python -B analyse_optimised_transition_model.py --self-check
+        if ($LASTEXITCODE -ne 0) { return }
+        & $Python -B build_publication_fs_ms.py --self-check
         if ($LASTEXITCODE -ne 0) { return }
         & matlab -batch "addpath('$MatRepo'); vg=fullfile('$MatRepo','external','VG-microstates'); addpath(vg); setup_microstate_paths(vg); test_spm_mix_prior;"
         if ($LASTEXITCODE -eq 0) { 'ok' | Set-Content -LiteralPath (Join-Path $Analysis 'self_checks.ok') }
@@ -109,7 +110,9 @@ try {
         & matlab -batch "addpath('$MatRepo'); export_directional_peak_windows('$MatResults','$MatManifest','$(Quote-Matlab $PeakWindows)');"
     } -Force
 
-    Invoke-Stage 'focused_analysis' @($Summary,(Join-Path $Analysis 'RESULTS.md'),(Join-Path $Analysis 'AUDIT.txt'),
+    Invoke-Stage 'retained_analysis' @((Join-Path $Analysis 'RETAINED_RESULTS.md'),
+        (Join-Path $Analysis 'RETAINED_AUDIT.json'),
+        (Join-Path $Analysis 'data\retained_summary.json'),
         (Join-Path $Analysis 'data\ecg_cache_schema.json'),(Join-Path $Analysis 'data\analysis_schema.json'),
         (Join-Path $Analysis 'data\hr_participant_period_cells.csv'),
         (Join-Path $Analysis 'data\hr_bayesian_cells.csv'),
@@ -117,63 +120,15 @@ try {
         (Join-Path $Analysis 'data\autonomic_level_participant_cells.csv'),
         (Join-Path $Analysis 'data\autonomic_level_bayesian_cells.csv'),
         (Join-Path $Analysis 'data\autonomic_level_bayesian_contrasts.csv'),
-        (Join-Path $Analysis 'data\c_origin_preictal_windows.csv'),
-        (Join-Path $Analysis 'data\c_origin_late_preictal.csv'),
-        (Join-Path $Analysis 'data\c_origin_primary_bayesian.csv'),
-        (Join-Path $Analysis 'data\c_origin_subsidiary_bayesian.csv'),
-        (Join-Path $Analysis 'data\c_origin_dd_paired_values.csv'),
         (Join-Path $Analysis 'data\c_origin_js_recovery.csv'),
         (Join-Path $Analysis 'data\c_origin_js_recovery_paired_events.csv'),
-        (Join-Path $Analysis 'data\fs_autonomic_c_origin_correlations.csv'),
-        (Join-Path $Analysis 'data\bayesian_predictive_flow.csv'),
-        (Join-Path $Analysis 'data\preictal_kappa_js_participant.csv'),
-        (Join-Path $Analysis 'data\preictal_kappa_js_lines.csv'),
         (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz'),
         (Join-Path $Analysis 'data\autonomic_native_ii_standardised.csv.gz'),
-        (Join-Path $Analysis 'data\state_reference_qc.csv'),
-        (Join-Path $Analysis 'data\posterior_fs_c_origin_c_log_kappa_autonomic_association.npz'),
-        (Join-Path $Analysis 'data\posterior_fs_ii_versus_last_minute_flow_autonomic_to_c_coverage.npz'),
-        (Join-Path $Analysis 'data\raw_count_c_origin_bayesian.csv'),
-        (Join-Path $Analysis 'data\raw_count_c_origin_event_means.csv'),
-        (Join-Path $Analysis 'data\c_origin_route_destination_bayesian.csv'),
-        (Join-Path $Analysis 'data\c_origin_destination_participant_means.csv'),
-        (Join-Path $Analysis 'data\all_state_raw_count_specificity_bayesian.csv'),
-        (Join-Path $Analysis 'data\c_reference_threshold_sensitivity_bayesian.csv'),
-        (Join-Path $Analysis 'data\c_origin_preictal_binned_trajectory_bayesian.csv'),
-        (Join-Path $Analysis 'data\preictal_physiology_trajectory_bayesian.csv'),
-        (Join-Path $Analysis 'data\c_origin_recovery_matched_bayesian.csv'),
-        (Join-Path $Analysis 'data\matched_interictal_pseudo_onset_bayesian.csv'),
-        (Join-Path $Analysis 'data\matched_interictal_pseudo_onsets.csv'),
-        (Join-Path $Analysis 'data\feedback_analysis_summary.json')) {
+        (Join-Path $Analysis 'data\state_reference_qc.csv')) {
         & $Python -B analyse_focused_fs_ms.py --results-dir $Results --manifest $Manifest `
             --ecg-qc-dir $EcgQc --original-ecg-qc-dir $OriginalEcgQc --demographics-csv $Demographics `
-            --peak-windows-csv $PeakWindows --out-dir $Analysis --reuse-ecg
+            --peak-windows-csv $PeakWindows --out-dir $Analysis --reuse-ecg --retained-only
     }
-
-    Invoke-Stage 'focused_plots' @(
-        (Join-Path $Analysis 'PLOT_AUDIT.json'),
-        (Join-Path $Analysis 'figures\dense_rr_hr.png'),
-        (Join-Path $Analysis 'figures\microstate_coverage.png'),
-        (Join-Path $Analysis 'figures\robust_autonomic_interictal_preictal.png'),
-        (Join-Path $Analysis 'figures\c_origin_primary.png'),
-        (Join-Path $Analysis 'figures\c_origin_subsidiary_raw.png'),
-        (Join-Path $Analysis 'figures\c_origin_js_recovery.png'),
-        (Join-Path $Analysis 'figures\fs_autonomic_c_origin_correlations.png'),
-        (Join-Path $Analysis 'figures\bayesian_predictive_flow.png'),
-        (Join-Path $Analysis 'figures\preictal_kappa_vs_js.png'),
-        (Join-Path $Analysis 'figures\c_origin_final_minute_boxplots.png'),
-        (Join-Path $Analysis 'figures\c_origin_js_recovery_boxplots.png'),
-        (Join-Path $Analysis 'figures\fs_cpi_kappa_regression.png'),
-        (Join-Path $Analysis 'figures\fs_csi_to_c_regression.png'),
-        (Join-Path $Analysis 'figures\raw_count_c_origin.png'),
-        (Join-Path $Analysis 'figures\c_origin_route_destinations.png'),
-        (Join-Path $Analysis 'figures\all_state_specificity.png'),
-        (Join-Path $Analysis 'figures\preictal_physiology_trajectory.png'),
-        (Join-Path $Analysis 'figures\c_origin_js_kappa_state_space.png'),
-        (Join-Path $Analysis 'figures\matched_pseudo_onsets.png'),
-        (Join-Path $Analysis 'figures\measured_loop_diagram.png')) {
-        & $Python -B plot_focused_fs_ms.py --analysis-dir $Analysis
-    } -Force
 
     Invoke-Stage 'optimised_transition_model' @(
         (Join-Path $OptimisedAnalysis 'AUDIT.json'),
@@ -188,6 +143,17 @@ try {
             --native-windows-csv (Join-Path $Analysis 'data\autonomic_native_ii_standardised.csv.gz') `
             --reference-qc-csv (Join-Path $Analysis 'data\state_reference_qc.csv') `
             --out-dir $OptimisedAnalysis
+    }
+
+    Invoke-Stage 'publication_analysis' @(
+        (Join-Path $PublicationAnalysis 'RESULTS.md'),
+        (Join-Path $PublicationAnalysis 'PUBLICATION_AUDIT.json'),
+        (Join-Path $PublicationAnalysis 'ANALYSIS_DECISIONS.csv'),
+        (Join-Path $PublicationAnalysis 'figures\figure_03_transition_trajectories.png'),
+        (Join-Path $PublicationAnalysis 'figures\figure_09_fs_kappa_js_cpi_3d.png'),
+        (Join-Path $PublicationAnalysis 'figures\figure_10_es_kappa_js_cpi_3d.png')) {
+        & $Python -B build_publication_fs_ms.py --focused-dir $Analysis `
+            --optimised-dir $OptimisedAnalysis --out-dir $PublicationAnalysis
     }
     $State.result='completed'
 } catch {

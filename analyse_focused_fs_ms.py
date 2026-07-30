@@ -818,6 +818,41 @@ def run(args) -> dict:
     common["is_dd"] = common.participant.astype(str).isin(dd_participants).astype(int)
     common["is_functional_participant"] = common.participant.astype(str).isin(functional_participants).astype(int)
     common.to_csv(data_dir / "autonomic_peak_microstate_common_windows.csv.gz", index=False, compression="gzip")
+    if args.retained_only:
+        recovery = recovery_summary[recovery_summary.contrast.str.startswith("Overall")].iloc[0]
+        report = [
+            "# Retained clinical and physiological analyses", "",
+            "This intermediate analysis intentionally excludes legacy transition, route, specificity, autonomic-association and pairwise flow models. Those estimands are replaced by the hierarchical multinomial, latent-factor and joint dynamic analyses.", "",
+            "## Cohort and events", "", markdown_table(demographics_table, list(demographics_table.columns)), "",
+            markdown_table(event_table, list(event_table.columns)), "",
+            "## Heart rate", "", markdown_table(hr_summary, ["contrast", "median", "ci95_low", "ci95_high", "n_participants"]), "",
+            "## Microstate coverage", "", markdown_table(coverage_summary, ["microstate", "contrast", "median", "ci95_low", "ci95_high", "n_participants"]), "",
+            "## Autonomic levels", "", markdown_table(autonomic_summary, ["index", "contrast", "median", "ci95_low", "ci95_high", "ratio_median", "ratio_ci95_low", "ratio_ci95_high", "probability_gt_zero", "n_participants"]), "",
+            "## Postictal recovery", "", markdown_table(recovery_summary, ["contrast", "median", "ci95_low", "ci95_high", "probability_lt_zero", "n_participants"]), "",
+            "These retained analyses answer questions not subsumed by the preictal transition model: clinical context, occupancy, autonomic level and postictal recovery.",
+        ]
+        (args.out_dir / "RETAINED_RESULTS.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+        summary = {"participants": int(manifest.participant.nunique()),
+                   "c_reference_valid_participants": len(valid_c_participants),
+                   "ecg_records_valid": int(ecg_qc.autonomic_valid.sum()),
+                   "common_windows": len(common),
+                   "recovery_probability_post_lt_pre": float(recovery.probability_lt_zero),
+                   "replaced_legacy_transition_models_run": False,
+                   "replaced_legacy_flow_models_run": False}
+        (data_dir / "retained_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        (data_dir / "analysis_schema.json").write_text(json.dumps({
+            "schema": "focused-retained-only-v1", "retained": ["demographics", "heart_rate", "coverage", "autonomic_levels", "postictal_recovery"],
+            "replaced": ["legacy_transition_models", "legacy_route_tests", "legacy_specificity_tests", "legacy_autonomic_associations", "legacy_pairwise_flow"],
+            "state_reference_min_abs_correlation": STATE_REFERENCE_MIN_CORRELATION}, indent=2), encoding="utf-8")
+        audit = {"completed_utc": datetime.now(timezone.utc).isoformat(), "mode": "retained-only",
+                 "results_dir": str(args.results_dir), "manifest": str(args.manifest),
+                 "peak_windows_csv": str(args.peak_windows_csv),
+                 "global_labels": list(load_global_labels(args.results_dir)),
+                 "code_sha256": {path.name: file_sha256(path) for path in
+                                  (Path(__file__), Path(__file__).with_name("analyse_candia_autonomic.py"))},
+                 **summary}
+        (args.out_dir / "RETAINED_AUDIT.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+        return summary
     association_summary = correlation_models(common, functional_participants, data_dir, args)
     flow_summary = flow_models(common, functional_participants, data_dir, args)
     feedback_summary = priorities.run(peak_table, reference_qc, common, data_dir, args.transition_draws,
@@ -957,6 +992,7 @@ def main() -> None:
     parser.add_argument("--chains", type=int, default=4); parser.add_argument("--iterations", type=int, default=3000)
     parser.add_argument("--burn", type=int, default=1200); parser.add_argument("--thin", type=int, default=2); parser.add_argument("--seed", type=int, default=26072026)
     parser.add_argument("--transition-draws", type=int, default=1200)
+    parser.add_argument("--retained-only", action="store_true")
     parser.add_argument("--reuse-ecg", action="store_true"); parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     if args.self_check: self_check(); print("self-check passed"); return

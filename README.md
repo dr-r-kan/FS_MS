@@ -13,43 +13,40 @@ run_everything.cmd
 The only interactive step is entering and confirming the six global labels.
 Completed stages are reused on rerun.
 
-To tweak and regenerate every figure without rerunning ECG processing or any
-Bayesian model, edit `plot_focused_fs_ms.py` and run:
+The current publication pipeline is deliberately non-duplicative. It retains
+cohort/event context, heart rate, microstate coverage, autonomic levels and
+postictal recovery. The hierarchical multinomial model replaces the legacy
+C-origin transition models, raw-count sensitivities, route tests, pairwise
+source-specificity tests, autonomic kitchen-sink associations and long
+predictive-flow forests. The final publication stage combines only the retained
+and replacement results.
+
+To rebuild the curated report and publication figures from saved model outputs:
 
 ```powershell
-.\.venv\Scripts\python.exe -B plot_focused_fs_ms.py --analysis-dir "G:\FS_microstates_study\vg_microstates\focused_analysis_final"
+.\.venv\Scripts\python.exe -B build_publication_fs_ms.py `
+  --focused-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced" `
+  --optimised-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced\optimised" `
+  --out-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\publication_final"
 ```
 
-The plotting script reads only saved CSV/NPZ files under `data\` and overwrites
-the paper PNG files under `figures\`, then records the renderer and figure hashes
-in `PLOT_AUDIT.json`. A full `run_everything.cmd` run invokes the same script as
-its final `focused_plots` stage.
+The final folder contains ten grouped figures as both 400-dpi PNG and vector PDF,
+curated result tables, an explicit keep/replace ledger, and complete hashes.
+Separate matched-axis 3D views show κ, J and CPI for FS and ES with event-bin
+jitter and time-bin centroid paths.
 
-The focused run also performs the feedback-driven transition sensitivities:
-raw C-exit count posteriors, fixed-30-exit and matched-60-second comparisons,
-matched interictal pseudo-onsets, route/concentration and destination
-decomposition, all-source specificity, C-reference threshold sensitivity,
-preictal trajectories, and lagged autonomic models for C coverage, JS and κ.
-Requested respiration, movement/EMG, CFA variants, alternate segmentations and
-VR links require source exports that are not present and are listed explicitly
-in `data\feedback_analysis_summary.json` rather than imputed.
-
-The optimised hierarchy reuses those saved microstate/count exports and writes
-only the new model outputs:
+The optimised hierarchy can still be run directly:
 
 ```powershell
 .\.venv\Scripts\python.exe -B analyse_optimised_transition_model.py
 ```
 
-Its default output is
-`C:\Users\Admin\OneDrive - NHS\FS_MS\equalised and optimised`. It fits one
-hierarchical multinomial count model, derives the three primary transition
-outcomes, tests the planned early/late contrasts, defines interictal autonomic
-PCs, and compares the five dynamic models by leave-one-event-out prediction.
-`run_everything.cmd` invokes it automatically after the focused plots stage and
-writes it under the analysis folder's `optimised` subdirectory, preventing its
-report and summary from overwriting the retained analysis. Override that path
-with `-OptimisedAnalysis "D:\path\to\output"`.
+It fits one hierarchical multinomial count model, derives the three primary
+transition outcomes, tests the planned early/late contrasts, defines interictal
+autonomic PCs, and compares five dynamic models by leave-one-event-out
+prediction. `run_everything.cmd` runs the retained-only analysis, the optimised
+model, then the publication builder. Override the final folder with
+`-PublicationAnalysis "D:\path\to\output"`.
 
 ## Output directories
 
@@ -60,9 +57,11 @@ Defaults are the `$Results` and `$Analysis` parameters at the top of
 run_everything.cmd -Analysis "C:\Users\Admin\OneDrive - NHS\FS_MS\focused_analysis_final"
 ```
 
-`-Results` holds the large fitted hierarchy. `-Analysis` holds `RESULTS.md`,
-figures, tables, logs, and analysis caches. Keep `-Results` on `G:` unless you
-specifically want the hierarchy synchronized by OneDrive.
+`-Results` holds the large fitted hierarchy. `-Analysis` holds retained inputs,
+logs, and reusable caches; `-OptimisedAnalysis` holds the replacement-model
+outputs; and `-PublicationAnalysis` is the small curated report with the final
+figures and tables. Keep `-Results` on `G:` unless you specifically want the
+hierarchy synchronized by OneDrive.
 
 Files retired from earlier analyses are recoverable under `OLD/`, which is
 excluded from Git.
