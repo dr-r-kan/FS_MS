@@ -46,8 +46,10 @@ Its default output is
 hierarchical multinomial count model, derives the three primary transition
 outcomes, tests the planned early/late contrasts, defines interictal autonomic
 PCs, and compares the five dynamic models by leave-one-event-out prediction.
-`run_everything.cmd` invokes it automatically after the focused analysis stage;
-override its output with `-OptimisedAnalysis "D:\path\to\output"`.
+`run_everything.cmd` invokes it automatically after the focused plots stage and
+writes it under the analysis folder's `optimised` subdirectory, preventing its
+report and summary from overwriting the retained analysis. Override that path
+with `-OptimisedAnalysis "D:\path\to\output"`.
 
 ## Output directories
 

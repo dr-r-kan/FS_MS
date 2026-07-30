@@ -4,10 +4,11 @@ param(
     [string]$Manifest = 'G:\FS_microstates_study\vg_microstates\vg_microstate_manifest_mat_paper_20260723.csv',
     [string]$Results = 'G:\FS_microstates_study\vg_microstates\focused_hierarchy_final',
     [string]$Analysis = 'G:\FS_microstates_study\vg_microstates\focused_analysis_final',
-    [string]$OptimisedAnalysis = 'C:\Users\Admin\OneDrive - NHS\FS_MS\equalised and optimised',
+    [string]$OptimisedAnalysis = '',
     [string[]]$ManualLabels = @()
 )
 
+$OptimisedAnalysis = if ($OptimisedAnalysis) { $OptimisedAnalysis } else { Join-Path $Analysis 'optimised' }
 $ErrorActionPreference = 'Stop'
 $Python = Join-Path $Repo '.venv\Scripts\python.exe'
 $EcgQc = 'G:\FS_microstates_study\heppy_output_spmms_20260724\ecg_qc'
@@ -149,21 +150,6 @@ try {
             --peak-windows-csv $PeakWindows --out-dir $Analysis --reuse-ecg
     }
 
-    Invoke-Stage 'optimised_transition_model' @(
-        (Join-Path $OptimisedAnalysis 'AUDIT.json'),
-        (Join-Path $OptimisedAnalysis 'RESULTS.md'),
-        (Join-Path $OptimisedAnalysis 'data\summary.json'),
-        (Join-Path $OptimisedAnalysis 'data\hierarchical_multinomial_posterior.nc'),
-        (Join-Path $OptimisedAnalysis 'data\planned_early_late_contrasts.csv'),
-        (Join-Path $OptimisedAnalysis 'data\dynamic_loop_model_comparison.csv')) {
-        & $Python -B analyse_optimised_transition_model.py `
-            --peak-windows-csv $PeakWindows `
-            --common-windows-csv (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz') `
-            --native-windows-csv (Join-Path $Analysis 'data\autonomic_native_ii_standardised.csv.gz') `
-            --reference-qc-csv (Join-Path $Analysis 'data\state_reference_qc.csv') `
-            --out-dir $OptimisedAnalysis
-    }
-
     Invoke-Stage 'focused_plots' @(
         (Join-Path $Analysis 'PLOT_AUDIT.json'),
         (Join-Path $Analysis 'figures\dense_rr_hr.png'),
@@ -188,6 +174,21 @@ try {
         (Join-Path $Analysis 'figures\measured_loop_diagram.png')) {
         & $Python -B plot_focused_fs_ms.py --analysis-dir $Analysis
     } -Force
+
+    Invoke-Stage 'optimised_transition_model' @(
+        (Join-Path $OptimisedAnalysis 'AUDIT.json'),
+        (Join-Path $OptimisedAnalysis 'RESULTS.md'),
+        (Join-Path $OptimisedAnalysis 'data\summary.json'),
+        (Join-Path $OptimisedAnalysis 'data\hierarchical_multinomial_posterior.nc'),
+        (Join-Path $OptimisedAnalysis 'data\planned_early_late_contrasts.csv'),
+        (Join-Path $OptimisedAnalysis 'data\dynamic_loop_model_comparison.csv')) {
+        & $Python -B analyse_optimised_transition_model.py `
+            --peak-windows-csv $PeakWindows `
+            --common-windows-csv (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz') `
+            --native-windows-csv (Join-Path $Analysis 'data\autonomic_native_ii_standardised.csv.gz') `
+            --reference-qc-csv (Join-Path $Analysis 'data\state_reference_qc.csv') `
+            --out-dir $OptimisedAnalysis
+    }
     $State.result='completed'
 } catch {
     $State.result='failed'; $State.error=$_.Exception.ToString(); Write-Error $_ -ErrorAction Continue
