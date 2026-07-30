@@ -4,6 +4,7 @@ param(
     [string]$Manifest = 'G:\FS_microstates_study\vg_microstates\vg_microstate_manifest_mat_paper_20260723.csv',
     [string]$Results = 'G:\FS_microstates_study\vg_microstates\focused_hierarchy_final',
     [string]$Analysis = 'G:\FS_microstates_study\vg_microstates\focused_analysis_final',
+    [string]$OptimisedAnalysis = 'C:\Users\Admin\OneDrive - NHS\FS_MS\equalised and optimised',
     [string[]]$ManualLabels = @()
 )
 
@@ -18,7 +19,7 @@ $Audit = Join-Path $Analysis 'pipeline_audit.json'
 $Log = Join-Path $Analysis 'pipeline_run.log'
 $Mutex = [System.Threading.Mutex]::new($false, 'Global\FSMS_FOCUSED_PIPELINE')
 $HasMutex = $false
-$State = [ordered]@{started_utc=[DateTime]::UtcNow.ToString('o'); results=$Results; analysis=$Analysis; stages=[ordered]@{}}
+$State = [ordered]@{started_utc=[DateTime]::UtcNow.ToString('o'); results=$Results; analysis=$Analysis; optimised_analysis=$OptimisedAnalysis; stages=[ordered]@{}}
 
 function Test-Outputs([string[]]$Paths) {
     foreach ($Path in $Paths) {
@@ -43,7 +44,7 @@ function Invoke-Stage([string]$Name, [string[]]$Outputs, [scriptblock]$Action, [
 function Quote-Matlab([string]$Value) { $Value.Replace("'", "''") }
 
 try {
-    New-Item -ItemType Directory -Force -Path $Results, $Analysis, (Join-Path $Analysis 'data'), (Join-Path $Analysis 'figures') | Out-Null
+    New-Item -ItemType Directory -Force -Path $Results, $Analysis, $OptimisedAnalysis, (Join-Path $Analysis 'data'), (Join-Path $Analysis 'figures') | Out-Null
     Start-Transcript -LiteralPath $Log -Append | Out-Null
     try { $HasMutex = $Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasMutex = $true }
     if (-not $HasMutex) { throw 'Another focused FS_MS pipeline is running.' }
@@ -57,6 +58,8 @@ try {
         & $Python -B analyse_focused_fs_ms.py --self-check
         if ($LASTEXITCODE -ne 0) { return }
         & $Python -B plot_focused_fs_ms.py --self-check
+        if ($LASTEXITCODE -ne 0) { return }
+        & $Python -B analyse_optimised_transition_model.py --self-check
         if ($LASTEXITCODE -ne 0) { return }
         & matlab -batch "addpath('$MatRepo'); vg=fullfile('$MatRepo','external','VG-microstates'); addpath(vg); setup_microstate_paths(vg); test_spm_mix_prior;"
         if ($LASTEXITCODE -eq 0) { 'ok' | Set-Content -LiteralPath (Join-Path $Analysis 'self_checks.ok') }
@@ -125,6 +128,8 @@ try {
         (Join-Path $Analysis 'data\preictal_kappa_js_participant.csv'),
         (Join-Path $Analysis 'data\preictal_kappa_js_lines.csv'),
         (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz'),
+        (Join-Path $Analysis 'data\autonomic_native_ii_standardised.csv.gz'),
+        (Join-Path $Analysis 'data\state_reference_qc.csv'),
         (Join-Path $Analysis 'data\posterior_fs_c_origin_c_log_kappa_autonomic_association.npz'),
         (Join-Path $Analysis 'data\posterior_fs_ii_versus_last_minute_flow_autonomic_to_c_coverage.npz'),
         (Join-Path $Analysis 'data\raw_count_c_origin_bayesian.csv'),
@@ -142,6 +147,21 @@ try {
         & $Python -B analyse_focused_fs_ms.py --results-dir $Results --manifest $Manifest `
             --ecg-qc-dir $EcgQc --original-ecg-qc-dir $OriginalEcgQc --demographics-csv $Demographics `
             --peak-windows-csv $PeakWindows --out-dir $Analysis --reuse-ecg
+    }
+
+    Invoke-Stage 'optimised_transition_model' @(
+        (Join-Path $OptimisedAnalysis 'AUDIT.json'),
+        (Join-Path $OptimisedAnalysis 'RESULTS.md'),
+        (Join-Path $OptimisedAnalysis 'data\summary.json'),
+        (Join-Path $OptimisedAnalysis 'data\hierarchical_multinomial_posterior.nc'),
+        (Join-Path $OptimisedAnalysis 'data\planned_early_late_contrasts.csv'),
+        (Join-Path $OptimisedAnalysis 'data\dynamic_loop_model_comparison.csv')) {
+        & $Python -B analyse_optimised_transition_model.py `
+            --peak-windows-csv $PeakWindows `
+            --common-windows-csv (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz') `
+            --native-windows-csv (Join-Path $Analysis 'data\autonomic_native_ii_standardised.csv.gz') `
+            --reference-qc-csv (Join-Path $Analysis 'data\state_reference_qc.csv') `
+            --out-dir $OptimisedAnalysis
     }
 
     Invoke-Stage 'focused_plots' @(
