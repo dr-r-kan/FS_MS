@@ -4,13 +4,13 @@ param(
     [string]$Manifest = 'G:\FS_microstates_study\vg_microstates\vg_microstate_manifest_mat_paper_20260723.csv',
     [string]$Results = 'G:\FS_microstates_study\vg_microstates\focused_hierarchy_final',
     [string]$Analysis = 'G:\FS_microstates_study\vg_microstates\focused_analysis_final',
-    [string]$OptimisedAnalysis = '',
     [string]$PublicationAnalysis = '',
+    [string]$ReviewAnalysis = '',
     [string[]]$ManualLabels = @()
 )
 
-$OptimisedAnalysis = if ($OptimisedAnalysis) { $OptimisedAnalysis } else { Join-Path $Analysis 'optimised' }
 $PublicationAnalysis = if ($PublicationAnalysis) { $PublicationAnalysis } else { Join-Path (Split-Path -Parent $Analysis) 'publication_final' }
+$ReviewAnalysis = if ($ReviewAnalysis) { $ReviewAnalysis } else { Join-Path (Split-Path -Parent $PublicationAnalysis) 'for_review' }
 $ErrorActionPreference = 'Stop'
 $Python = Join-Path $Repo '.venv\Scripts\python.exe'
 $EcgQc = 'G:\FS_microstates_study\heppy_output_spmms_20260724\ecg_qc'
@@ -21,7 +21,7 @@ $Audit = Join-Path $Analysis 'pipeline_audit.json'
 $Log = Join-Path $Analysis 'pipeline_run.log'
 $Mutex = [System.Threading.Mutex]::new($false, 'Global\FSMS_FOCUSED_PIPELINE')
 $HasMutex = $false
-$State = [ordered]@{started_utc=[DateTime]::UtcNow.ToString('o'); results=$Results; analysis=$Analysis; optimised_analysis=$OptimisedAnalysis; publication_analysis=$PublicationAnalysis; stages=[ordered]@{}}
+$State = [ordered]@{started_utc=[DateTime]::UtcNow.ToString('o'); results=$Results; analysis=$Analysis; publication_analysis=$PublicationAnalysis; review_analysis=$ReviewAnalysis; stages=[ordered]@{}}
 
 function Test-Outputs([string[]]$Paths) {
     foreach ($Path in $Paths) {
@@ -46,7 +46,7 @@ function Invoke-Stage([string]$Name, [string[]]$Outputs, [scriptblock]$Action, [
 function Quote-Matlab([string]$Value) { $Value.Replace("'", "''") }
 
 try {
-    New-Item -ItemType Directory -Force -Path $Results, $Analysis, $OptimisedAnalysis, (Join-Path $Analysis 'data') | Out-Null
+    New-Item -ItemType Directory -Force -Path $Results, $Analysis, (Join-Path $Analysis 'data') | Out-Null
     Start-Transcript -LiteralPath $Log -Append | Out-Null
     try { $HasMutex = $Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasMutex = $true }
     if (-not $HasMutex) { throw 'Another focused FS_MS pipeline is running.' }
@@ -59,9 +59,7 @@ try {
     Invoke-Stage 'self_checks' @((Join-Path $Analysis 'self_checks.ok')) {
         & $Python -B analyse_focused_fs_ms.py --self-check
         if ($LASTEXITCODE -ne 0) { return }
-        & $Python -B analyse_optimised_transition_model.py --self-check
-        if ($LASTEXITCODE -ne 0) { return }
-        & $Python -B build_publication_fs_ms.py --self-check
+        & $Python -B analyse_global_transition_exploration.py --self-check
         if ($LASTEXITCODE -ne 0) { return }
         & matlab -batch "addpath('$MatRepo'); vg=fullfile('$MatRepo','external','VG-microstates'); addpath(vg); setup_microstate_paths(vg); test_spm_mix_prior;"
         if ($LASTEXITCODE -eq 0) { 'ok' | Set-Content -LiteralPath (Join-Path $Analysis 'self_checks.ok') }
@@ -130,37 +128,25 @@ try {
             --peak-windows-csv $PeakWindows --out-dir $Analysis --reuse-ecg --retained-only
     }
 
-    Invoke-Stage 'optimised_transition_model' @(
-        (Join-Path $OptimisedAnalysis 'AUDIT.json'),
-        (Join-Path $OptimisedAnalysis 'RESULTS.md'),
-        (Join-Path $OptimisedAnalysis 'data\summary.json'),
-        (Join-Path $OptimisedAnalysis 'data\hierarchical_multinomial_posterior.nc'),
-        (Join-Path $OptimisedAnalysis 'data\planned_early_late_contrasts.csv'),
-        (Join-Path $OptimisedAnalysis 'data\matched_pseudo_difference_in_differences.csv'),
-        (Join-Path $OptimisedAnalysis 'data\confirmatory_fit_diagnostics.json'),
-        (Join-Path $OptimisedAnalysis 'data\posterior_predictive_checks.csv'),
-        (Join-Path $OptimisedAnalysis 'data\simulation_recovery.csv'),
-        (Join-Path $OptimisedAnalysis 'data\dynamic_loop_model_comparison.csv')) {
-        & $Python -B analyse_optimised_transition_model.py `
-            --peak-windows-csv $PeakWindows `
-            --common-windows-csv (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz') `
-            --native-windows-csv (Join-Path $Analysis 'data\autonomic_native_ii_standardised.csv.gz') `
-            --reference-qc-csv (Join-Path $Analysis 'data\state_reference_qc.csv') `
-            --out-dir $OptimisedAnalysis
-    }
-
-    Invoke-Stage 'publication_analysis' @(
+    Invoke-Stage 'global_first_publication_analysis' @(
         (Join-Path $PublicationAnalysis 'RESULTS.md'),
         (Join-Path $PublicationAnalysis 'PUBLICATION_AUDIT.json'),
         (Join-Path $PublicationAnalysis 'ANALYSIS_DECISIONS.csv'),
         (Join-Path $PublicationAnalysis 'tables\matched_pseudo_difference_in_differences.csv'),
-        (Join-Path $PublicationAnalysis 'tables\confirmatory_fit_diagnostics.json'),
-        (Join-Path $PublicationAnalysis 'figures\figure_03_transition_trajectories.png'),
-        (Join-Path $PublicationAnalysis 'figures\figure_09_fs_kappa_js_cpi_3d.png'),
-        (Join-Path $PublicationAnalysis 'figures\figure_10_es_kappa_js_cpi_3d.png')) {
-        & $Python -B build_publication_fs_ms.py --focused-dir $Analysis `
-            --optimised-dir $OptimisedAnalysis --out-dir $PublicationAnalysis --overwrite
-    }
+        (Join-Path $PublicationAnalysis 'tables\manifold_loadings.csv'),
+        (Join-Path $PublicationAnalysis 'tables\stepwise_logistic_models.csv'),
+        (Join-Path $PublicationAnalysis 'tables\state_exploratory_associations.csv'),
+        (Join-Path $PublicationAnalysis 'figures\figure_01_global_transition_trajectories.png'),
+        (Join-Path $PublicationAnalysis 'figures\figure_02_js_kappa_csi_cpi_manifold.png'),
+        (Join-Path $PublicationAnalysis 'figures\figure_03_stepwise_logistic.png'),
+        (Join-Path $PublicationAnalysis 'figures\figure_04_exploratory_state_drilldown.png'),
+        (Join-Path $PublicationAnalysis 'figures\figure_05_matched_pseudo_sensitivity.png'),
+        (Join-Path $ReviewAnalysis 'README.md')) {
+        & $Python -B analyse_global_transition_exploration.py `
+            --peak-windows-csv $PeakWindows `
+            --common-windows-csv (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz') `
+            --focused-dir $Analysis --out-dir $PublicationAnalysis --review-dir $ReviewAnalysis --overwrite
+    } -Force
     $State.result='completed'
 } catch {
     $State.result='failed'; $State.error=$_.Exception.ToString(); Write-Error $_ -ErrorAction Continue

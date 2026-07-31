@@ -1,72 +1,57 @@
-# FS_MS focused analysis
+# FS_MS global-first analysis
 
-The retained pipeline starts from the converted MAT manifest and runs the K=6
-hierarchy, manual global labelling, participant backfit, and focused cardiac /
-microstate analyses.
+The publication pipeline reuses the fitted K=6 microstates and starts with the
+whole transition grammar. No microstate is privileged in the headline model.
 
-Run:
+The primary transition quantities are:
+
+- global Jensen–Shannon divergence from each participant's interictal grammar;
+- one global baseline-oriented concentration parameter, κ.
+
+Interictal windows use a leave-that-window-out participant baseline. Preictal
+windows use the participant's pooled interictal baseline. The fixed transition
+threshold is 30; transition count is an eligibility/information quantity, not a
+predictor.
+
+After the global analysis, the pipeline:
+
+- drills down across all six source microstates as BH-FDR-controlled exploratory work;
+- tests exploratory CSI, CPI and semiology associations by source state;
+- fits an auditable two-dimensional PCA manifold in JS, κ, CSI and CPI and plots
+  FS and ES movement from II through five preictal bins;
+- fits planned nested logistic models in the order JS → κ → CSI → CPI,
+  evaluated with leave-one-participant-out predictions;
+- retains the participant-matched genuine/pseudo difference-in-differences so a
+  phenotype is not mislabeled as an onset-specific biomarker.
+
+Run the complete reusable pipeline with:
 
 ```powershell
 run_everything.cmd
 ```
 
-The only interactive step is entering and confirming the six global labels.
-Completed stages are reused on rerun.
+The one interactive step is confirming the six global labels if the reusable
+hierarchy has not already completed. Existing microstate fits, ECG caches and
+completed upstream stages are reused.
 
-The current publication pipeline is deliberately non-duplicative. It retains
-cohort/event context, heart rate, microstate coverage, autonomic levels and
-postictal recovery. The hierarchical multinomial model replaces the legacy
-C-origin transition models, raw-count sensitivities, route tests, pairwise
-source-specificity tests, autonomic kitchen-sink associations and long
-predictive-flow forests. The final publication stage combines only the retained
-and replacement results. Its logits use destination-labelled source→destination
-edges with a symmetric sum-to-zero constraint, so cross-source shrinkage never
-depends on a source-specific coordinate order. The confirmatory fit uses
-multiple-chain NUTS, posterior predictive checks and simulation recovery.
-
-To rebuild the curated report and publication figures from saved model outputs:
+To rebuild only the global-first publication analysis from retained data:
 
 ```powershell
-.\.venv\Scripts\python.exe -B build_publication_fs_ms.py `
+.\.venv\Scripts\python.exe -B analyse_global_transition_exploration.py `
+  --peak-windows-csv "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced\data\directional_peak_backfit_windows.csv" `
+  --common-windows-csv "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced\data\autonomic_peak_microstate_common_windows.csv.gz" `
   --focused-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced" `
-  --optimised-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced\optimised" `
-  --out-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\publication_final"
+  --out-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\publication_final" `
+  --review-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\for_review" `
+  --overwrite
 ```
 
-The final folder contains ten grouped figures as both 400-dpi PNG and vector PDF,
-curated result tables, an explicit keep/replace ledger, and complete hashes.
-Separate matched-axis 3D views show κ, J and CPI for FS and ES with event-bin
-jitter and time-bin centroid paths. The pseudo-onset panel reports the paired
-[FS genuine − FS pseudo] − [ES genuine − ES pseudo] estimand rather than an
-unmatched comparison.
+`publication_final` contains five 400-dpi/vector publication figures, exact
+analysis frames, PCA loadings/scores, participant-held-out predictions,
+exploratory source models, matched-pseudo balance, decisions and hashes.
+`for_review` is a self-contained small review package with the single analysis
+script, compressed reused inputs, all result tables and figures.
 
-The optimised hierarchy can still be run directly:
-
-```powershell
-.\.venv\Scripts\python.exe -B analyse_optimised_transition_model.py
-```
-
-It fits one hierarchical multinomial count model, derives the three primary
-transition outcomes, tests the planned early/late contrasts, defines interictal
-autonomic PCs, and compares five dynamic models by leave-one-event-out
-prediction. `run_everything.cmd` runs the retained-only analysis, the optimised
-model, then the publication builder. Override the final folder with
-`-PublicationAnalysis "D:\path\to\output"`.
-
-## Output directories
-
-Defaults are the `$Results` and `$Analysis` parameters at the top of
-`run_ace_manual_pipeline.ps1`. Override either without editing the file:
-
-```powershell
-run_everything.cmd -Analysis "C:\Users\Admin\OneDrive - NHS\FS_MS\focused_analysis_final"
-```
-
-`-Results` holds the large fitted hierarchy. `-Analysis` holds retained inputs,
-logs, and reusable caches; `-OptimisedAnalysis` holds the replacement-model
-outputs; and `-PublicationAnalysis` is the small curated report with the final
-figures and tables. Keep `-Results` on `G:` unless you specifically want the
-hierarchy synchronized by OneDrive.
-
-Files retired from earlier analyses are recoverable under `OLD/`, which is
-excluded from Git.
+The prior confirmatory hierarchy and 3D displays are not part of the headline
+pipeline: the attempted confirmatory fits failed validation, and the 2D
+four-variable manifold is more complete and easier to interpret.
