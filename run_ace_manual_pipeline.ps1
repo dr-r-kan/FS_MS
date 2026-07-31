@@ -136,16 +136,20 @@ try {
         (Join-Path $PublicationAnalysis 'tables\manifold_loadings.csv'),
         (Join-Path $PublicationAnalysis 'tables\stepwise_logistic_models.csv'),
         (Join-Path $PublicationAnalysis 'tables\state_exploratory_associations.csv'),
+        (Join-Path $PublicationAnalysis 'tables\subgroup_contrasts.csv'),
+        (Join-Path $PublicationAnalysis 'tables\demographic_summary.csv'),
         (Join-Path $PublicationAnalysis 'figures\figure_01_global_transition_trajectories.png'),
         (Join-Path $PublicationAnalysis 'figures\figure_02_js_kappa_csi_cpi_manifold.png'),
         (Join-Path $PublicationAnalysis 'figures\figure_03_stepwise_logistic.png'),
         (Join-Path $PublicationAnalysis 'figures\figure_04_exploratory_state_drilldown.png'),
         (Join-Path $PublicationAnalysis 'figures\figure_05_matched_pseudo_sensitivity.png'),
+        (Join-Path $PublicationAnalysis 'figures\figure_06_within_cohort_comparisons.png'),
         (Join-Path $ReviewAnalysis 'README.md')) {
         & $Python -B analyse_global_transition_exploration.py `
             --peak-windows-csv $PeakWindows `
             --common-windows-csv (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz') `
-            --focused-dir $Analysis --out-dir $PublicationAnalysis --review-dir $ReviewAnalysis --overwrite
+            --focused-dir $Analysis --manifest $Manifest --demographics-csv $Demographics `
+            --out-dir $PublicationAnalysis --review-dir $ReviewAnalysis --overwrite
     } -Force
     $State.result='completed'
 } catch {

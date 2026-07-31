@@ -21,6 +21,8 @@ After the global analysis, the pipeline:
   FS and ES movement from II through five preictal bins;
 - fits planned nested logistic models in the order JS → κ → CSI → CPI,
   evaluated with leave-one-participant-out predictions;
+- adds paired FS−ES trajectories within dual-diagnosis participants and
+  participant-clustered hypo−hyper trajectories within the FS cohort;
 - retains the participant-matched genuine/pseudo difference-in-differences so a
   phenotype is not mislabeled as an onset-specific biomarker.
 
@@ -41,12 +43,14 @@ To rebuild only the global-first publication analysis from retained data:
   --peak-windows-csv "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced\data\directional_peak_backfit_windows.csv" `
   --common-windows-csv "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced\data\autonomic_peak_microstate_common_windows.csv.gz" `
   --focused-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced" `
+  --manifest "G:\FS_microstates_study\vg_microstates\vg_microstate_manifest_mat_paper_20260723.csv" `
+  --demographics-csv ".\analysis_database.csv" `
   --out-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\publication_final" `
   --review-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\for_review" `
   --overwrite
 ```
 
-`publication_final` contains five 400-dpi/vector publication figures, exact
+`publication_final` contains six 400-dpi/vector publication figures, exact
 analysis frames, PCA loadings/scores, participant-held-out predictions,
 exploratory source models, matched-pseudo balance, decisions and hashes.
 `for_review` is a self-contained small review package with the single analysis

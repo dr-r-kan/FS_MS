@@ -212,12 +212,13 @@ def participant_cells(global_frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
         global_frame.condition.eq("preict") & global_frame.time_bin.isin(TIME_BINS) &
         global_frame.event_type.isin(("functional", "epileptic"))].copy()
     preictal["log_js"] = np.log(preictal.global_js.clip(lower=1e-8))
-    event = (preictal.groupby(["participant", "event_key", "event_type", "semiology", "time_bin"],
+    preictal["cohort_group"] = preictal["group"]
+    event = (preictal.groupby(["participant", "event_key", "cohort_group", "event_type", "semiology", "time_bin"],
                               observed=True, dropna=False)[[*MODEL_FEATURES, "global_js", "kappa"]]
              .mean().reset_index())
-    preictal_cells = (event.groupby(["participant", "event_type", "time_bin"], observed=True)
+    preictal_cells = (event.groupby(["participant", "cohort_group", "event_type", "time_bin"], observed=True)
                       [[*MODEL_FEATURES, "global_js", "kappa"]].mean().reset_index())
-    participant_types = preictal[["participant", "event_type"]].drop_duplicates()
+    participant_types = preictal[["participant", "cohort_group", "event_type"]].drop_duplicates()
     ii = global_frame[global_frame.condition.eq("ii")].copy()
     ii["log_js"] = np.log(ii.global_js.clip(lower=1e-8))
     ii = (ii.groupby("participant", observed=True)[[*MODEL_FEATURES, "global_js", "kappa"]]
@@ -280,6 +281,108 @@ def global_summaries(cells: pd.DataFrame, draws: int, seed: int) -> tuple[pd.Dat
     contrast["ratio_ci95_low"] = np.exp(contrast.ci95_low)
     contrast["ratio_ci95_high"] = np.exp(contrast.ci95_high)
     return summary, contrast
+
+
+def subgroup_comparisons(event: pd.DataFrame, draws: int, seed: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Participant-level DD FS−ES and FS hypo−hyper contrasts by preictal bin."""
+    rng = np.random.default_rng(seed)
+    outcomes = ("log_js", "log_kappa")
+    rows, contrasts = [], []
+
+    dd_source = event[event.cohort_group.eq("DD")]
+    dd_participants = dd_source.groupby("participant", observed=True).event_type.nunique().loc[lambda x: x == 2].index
+    dd = (dd_source[dd_source.participant.isin(dd_participants)]
+          .groupby(["participant", "event_type", "time_bin"], observed=True)[list(outcomes)]
+          .mean().reset_index())
+    for outcome in outcomes:
+        for time_bin in TIME_BINS:
+            pivot = dd[dd.time_bin.eq(time_bin)].pivot(index="participant", columns="event_type", values=outcome)
+            pair = pivot[["functional", "epileptic"]].dropna()
+            difference = (pair.functional - pair.epileptic).to_numpy(float)
+            estimate, low, high = bootstrap_interval(difference, rng, draws)
+            contrasts.append({"comparison": "DD paired FS minus ES", "outcome": outcome, "time_bin": time_bin,
+                              "estimate": estimate, "ci95_low": low, "ci95_high": high,
+                              "probability_gt_zero": float(np.mean(
+                                  np.mean(difference[rng.integers(0, len(difference), (draws, len(difference)))], axis=1) > 0)),
+                              "n_participants": len(pair), "n_level_1": len(pair), "n_level_2": len(pair),
+                              "n_paired": len(pair), "estimator": "paired participant mean; participant bootstrap"})
+            for level in ("functional", "epileptic"):
+                rows.extend({"comparison": "DD paired FS versus ES", "participant": participant,
+                             "level": "FS" if level == "functional" else "ES", "time_bin": time_bin,
+                             "outcome": outcome, "value": value}
+                            for participant, value in pair[level].items())
+
+    fs = (event[event.cohort_group.eq("FS") & event.event_type.eq("functional") &
+                      event.semiology.isin(("hypo", "hyper"))]
+          .groupby(["participant", "semiology", "time_bin"], observed=True)[list(outcomes)]
+          .mean().reset_index())
+    for outcome in outcomes:
+        for time_bin in TIME_BINS:
+            use = fs[fs.time_bin.eq(time_bin)].dropna(subset=[outcome])
+            participants = use.participant.unique()
+            hypo = use[use.semiology.eq("hypo")][outcome]
+            hyper = use[use.semiology.eq("hyper")][outcome]
+            samples = []
+            for _ in range(draws):
+                weights = pd.Series(rng.choice(participants, len(participants), replace=True)).value_counts()
+                sample = use.merge(weights.rename("weight"), left_on="participant", right_index=True)
+                means = sample.groupby("semiology", observed=True).apply(
+                    lambda part: np.average(part[outcome], weights=part.weight), include_groups=False)
+                if {"hypo", "hyper"}.issubset(means.index):
+                    samples.append(means.hypo - means.hyper)
+            samples = np.asarray(samples, float)
+            low, high = np.quantile(samples, (.025, .975))
+            paired = use.groupby("participant", observed=True).semiology.nunique().eq(2).sum()
+            contrasts.append({"comparison": "FS hypo minus hyper", "outcome": outcome, "time_bin": time_bin,
+                              "estimate": float(hypo.mean() - hyper.mean()), "ci95_low": low, "ci95_high": high,
+                              "probability_gt_zero": float(np.mean(samples > 0)),
+                              "n_participants": len(participants), "n_level_1": hypo.size, "n_level_2": hyper.size,
+                              "n_paired": int(paired),
+                              "estimator": "participant-semiology mean; participant-cluster bootstrap"})
+            rows.extend({"comparison": "FS hypo versus hyper", "participant": row.participant,
+                         "level": row.semiology, "time_bin": time_bin, "outcome": outcome,
+                         "value": getattr(row, outcome)} for row in use.itertuples(index=False))
+
+    contrast = pd.DataFrame(contrasts)
+    contrast["ratio"] = np.exp(contrast.estimate)
+    contrast["ratio_ci95_low"] = np.exp(contrast.ci95_low)
+    contrast["ratio_ci95_high"] = np.exp(contrast.ci95_high)
+    cells = pd.DataFrame(rows)
+    assert len(contrast) == 2 * 2 * len(TIME_BINS) and not cells.empty
+    return cells, contrast
+
+
+def refresh_demographics(manifest_path: Path, database_path: Path, tables: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Refresh anonymised cohort tables from the current manifest and clinical database."""
+    manifest = pd.read_csv(manifest_path, low_memory=False)
+    database = pd.read_csv(database_path, low_memory=False)
+    participants = manifest[["participant", "patient_id", "group"]].drop_duplicates("participant").copy()
+    demo = database[["patient_id", "age", "gender"]].drop_duplicates("patient_id").copy()
+    participants["patient_id"] = participants.patient_id.astype(str)
+    demo["patient_id"] = demo.patient_id.astype(str)
+    participants = participants.merge(demo, on="patient_id", how="left", validate="many_to_one")
+    participants["age"] = pd.to_numeric(participants.age, errors="coerce")
+    participants["gender"] = (participants.gender.astype(str).str.strip().str.lower()
+                              .replace({"nan": "unknown", "": "unknown", "f": "female", "m": "male"}))
+    summary = []
+    for group, part in participants.groupby("group", observed=True):
+        age = part.age.dropna(); genders = part.gender.value_counts()
+        summary.append({"group": group, "participants": len(part), "age_available": len(age),
+                        "age_median": age.median(), "age_q1": age.quantile(.25), "age_q3": age.quantile(.75),
+                        "female": genders.get("female", 0), "male": genders.get("male", 0),
+                        "gender_unknown": genders.get("unknown", 0)})
+    summary = pd.DataFrame(summary)
+    event_source = manifest[manifest.condition.astype(str).str.lower().isin(("preict", "transictal"))].copy()
+    event_source["semiology"] = (event_source.hypo_hyper.astype(str).str.strip().str.lower()
+                                  .replace({"nan": np.nan, "": np.nan}))
+    events = (event_source.groupby(["group", "condition", "seizure_type", "semiology"],
+                                   observed=True, dropna=False)
+              .agg(records=("file_path", "size"), participants=("participant", "nunique")).reset_index())
+    participants.to_csv(tables / "participant_demographics.csv", index=False)
+    summary.to_csv(tables / "demographic_summary.csv", index=False)
+    events.to_csv(tables / "event_characteristics.csv", index=False)
+    assert participants.participant.is_unique and len(participants) == int(summary.participants.sum())
+    return summary, events
 
 
 def match_pseudo_onsets(windows: pd.DataFrame, common: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -794,6 +897,45 @@ def plot_pseudo(paired: pd.DataFrame, did: pd.DataFrame, balance: pd.DataFrame,
     save_figure(fig, figures, "figure_05_matched_pseudo_sensitivity")
 
 
+def plot_subgroups(cells: pd.DataFrame, contrasts: pd.DataFrame, figures: Path, seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    fig, axes = plt.subplots(2, 2, figsize=(7.7, 5.2), layout="constrained", sharex=True)
+    specifications = (
+        ("DD paired FS versus ES", "DD paired FS minus ES", ("FS", "ES"), (FS_COLOR, ES_COLOR)),
+        ("FS hypo versus hyper", "FS hypo minus hyper", ("hypo", "hyper"), (PURPLE, GREEN)),
+    )
+    for row, (cell_name, contrast_name, levels, colors) in enumerate(specifications):
+        for column, outcome in enumerate(("log_js", "log_kappa")):
+            axis = axes[row, column]
+            use = cells[cells.comparison.eq(cell_name) & cells.outcome.eq(outcome)]
+            for offset, level, color in zip((-.10, .10), levels, colors):
+                means = []
+                for position, time_bin in enumerate(TIME_BINS):
+                    values = use[use.level.eq(level) & use.time_bin.eq(time_bin)].value.dropna().to_numpy(float)
+                    axis.scatter(position + offset + rng.uniform(-.045, .045, len(values)), values,
+                                 color=color, alpha=.13, s=7, linewidths=0, rasterized=True)
+                    means.append(np.mean(values) if len(values) else np.nan)
+                axis.plot(np.arange(len(TIME_BINS)) + offset, means, color=color, marker="o", ms=4,
+                          lw=1.7, markeredgecolor="white", markeredgewidth=.55, label=level.upper())
+            final = contrasts[contrasts.comparison.eq(contrast_name) & contrasts.outcome.eq(outcome) &
+                              contrasts.time_bin.eq(TIME_BINS[-1])].iloc[0]
+            axis.text(.02, .98, f"Final minute: {final.estimate:.2f} [{final.ci95_low:.2f}, {final.ci95_high:.2f}]",
+                      transform=axis.transAxes, ha="left", va="top", fontsize=7, color=GREY)
+            axis.set(ylabel="log JS" if outcome == "log_js" else "log κ",
+                     title=("Dual diagnosis: FS versus ES" if row == 0 else "Functional seizures: hypo versus hyper"))
+            axis.grid(axis="y")
+            panel(axis, chr(ord("A") + row * 2 + column))
+            if row == 1:
+                axis.set(xticks=np.arange(len(TIME_BINS)), xticklabels=TIME_BINS, xlabel="Minutes before onset")
+                axis.tick_params(axis="x", rotation=25)
+            if column == 0:
+                axis.legend(frameon=False, ncol=2, loc="lower left")
+    fig.suptitle("Within-cohort global transition trajectories", fontsize=11)
+    fig.text(.5, -.02, "Points are participant-level cells; lines are participant-equal means. Brackets are 95% participant-bootstrap intervals.",
+             ha="center", va="top", fontsize=7, color=GREY)
+    save_figure(fig, figures, "figure_06_within_cohort_comparisons")
+
+
 def markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
     use = frame[columns].copy()
     for column in use.select_dtypes(include="number"):
@@ -803,6 +945,7 @@ def markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
 
 
 def write_report(out_dir: Path, summary: pd.DataFrame, contrasts: pd.DataFrame,
+                 subgroup_contrasts: pd.DataFrame, demographics: pd.DataFrame,
                  logistic: pd.DataFrame, did: pd.DataFrame, associations: pd.DataFrame,
                  manifold_audit: dict, counts: dict) -> None:
     final = contrasts[contrasts.contrast.eq("FS minus ES") & contrasts.time_bin.eq("-1 to 0")]
@@ -818,11 +961,19 @@ def write_report(out_dir: Path, summary: pd.DataFrame, contrasts: pd.DataFrame,
         "## What this analysis changes", "",
         "No microstate is privileged at the outset. The headline analysis uses the entire six-state transition grammar: transition-count-weighted Jensen–Shannon divergence from each participant's interictal baseline and one joint baseline-oriented κ. Source-state, autonomic and semiological results are exploratory and BH-FDR controlled.", "",
         f"The analysis retained windows with at least {MIN_TRANSITIONS} off-diagonal transitions. Interictal windows use a leave-that-window-out participant reference; preictal windows use the participant's pooled interictal reference. Microstate fits were reused, not refitted.", "",
+        "## Updated cohort demographics", "",
+        markdown_table(demographics, ["group", "participants", "age_available", "age_median", "age_q1", "age_q3", "female", "male", "gender_unknown"]), "",
         "## Headline global findings", "",
         markdown_table(final[["outcome", "estimate", "ci95_low", "ci95_high", "ratio", "ratio_ci95_low", "ratio_ci95_high"]],
                        ["outcome", "estimate", "ci95_low", "ci95_high", "ratio", "ratio_ci95_low", "ratio_ci95_high"]), "",
         "The global trajectories are participant-equal summaries; points show participant cells and intervals are participant bootstraps. Ratios above one indicate higher FS values.", "",
         "![Global trajectories](figures/figure_01_global_transition_trajectories.png)", "",
+        "## Within-cohort comparisons", "",
+        "The dual-diagnosis comparison is paired within participant (FS minus ES). The functional-seizure semiology comparison is hypo minus hyper after event averaging within participant and semiology; its participant-cluster bootstrap preserves the partial pairing of participants who contributed both semiologies.", "",
+        markdown_table(subgroup_contrasts[subgroup_contrasts.time_bin.eq("-1 to 0")],
+                       ["comparison", "outcome", "estimate", "ci95_low", "ci95_high", "probability_gt_zero",
+                        "n_participants", "n_level_1", "n_level_2", "n_paired"]), "",
+        "![Within-cohort comparisons](figures/figure_06_within_cohort_comparisons.png)", "",
         "## Four-variable 2D manifold", "",
         f"A robustly scaled PCA captured {100 * sum(manifold_audit['explained_variance_ratio']):.1f}% of the JS–κ–CSI–CPI variance in two dimensions. Inputs were winsorised at the 1st/99th percentiles for this manifold only, with exact limits exported. It is unsupervised: FS/ES labels did not determine the axes. Participant paths and group centroids show movement from II through the five preictal bins.", "",
         "![Manifold](figures/figure_02_js_kappa_csi_cpi_manifold.png)", "",
@@ -856,6 +1007,7 @@ def analysis_decisions() -> pd.DataFrame:
         ("manifold", "replace", "Transparent robust-scaled PCA in JS, κ, CSI and CPI; report loadings and scores"),
         ("3D JS-κ-CPI displays", "replace", "The four-variable 2D manifold includes CSI and is easier to compare and reproduce"),
         ("classification", "add", "Planned JS → κ → CSI → CPI insertion; participant-held-out predictions"),
+        ("within-cohort comparisons", "add", "Paired DD FS−ES and participant-clustered FS hypo−hyper trajectories"),
         ("onset claim", "retain sensitivity", "Matched genuine-minus-pseudo difference-in-differences; no unmatched onset claim"),
         ("transition count", "retain", "Count defines multinomial information/eligibility only; minimum and equalised sensitivity target is 30"),
         ("clinical context", "retain", "Demographics, heart rate, coverage and autonomic-level tables are copied without re-estimation"),
@@ -874,6 +1026,7 @@ def build(args, out_dir: Path) -> dict:
     global_frame = merge_autonomic(global_frame, common)
     event, cells = participant_cells(global_frame)
     global_summary, global_contrasts = global_summaries(cells, args.bootstrap_draws, args.seed)
+    subgroup_cells, subgroup_contrasts = subgroup_comparisons(event, args.bootstrap_draws, args.seed + 7)
     manifold_scores, manifold_loadings, manifold_trajectory, manifold_audit = fit_manifold(
         cells, args.bootstrap_draws, args.seed + 1)
     logistic_models, logistic_predictions, logistic_coefficients = nested_logistic(
@@ -889,6 +1042,8 @@ def build(args, out_dir: Path) -> dict:
         "global_participant_period_cells.csv": cells,
         "global_trajectory_summary.csv": global_summary,
         "global_contrasts.csv": global_contrasts,
+        "subgroup_participant_cells.csv": subgroup_cells,
+        "subgroup_contrasts.csv": subgroup_contrasts,
         "manifold_scores.csv": manifold_scores,
         "manifold_loadings.csv": manifold_loadings,
         "manifold_trajectory.csv": manifold_trajectory,
@@ -906,13 +1061,17 @@ def build(args, out_dir: Path) -> dict:
     (tables / "manifold_audit.json").write_text(json.dumps(manifold_audit, indent=2), encoding="utf-8")
     decisions = analysis_decisions(); decisions.to_csv(out_dir / "ANALYSIS_DECISIONS.csv", index=False)
 
-    retained = ("demographic_summary.csv", "event_characteristics.csv", "hr_bayesian_cells.csv",
+    retained = ("participant_demographics.csv", "demographic_summary.csv", "event_characteristics.csv", "hr_bayesian_cells.csv",
                 "coverage_bayesian_cells.csv", "autonomic_level_participant_cells.csv",
                 "autonomic_level_bayesian_cells.csv", "autonomic_level_bayesian_contrasts.csv")
     for name in retained:
         source = args.focused_dir / "data" / name
         if source.exists():
             shutil.copy2(source, tables / name)
+    if args.manifest is not None:
+        demographics, _ = refresh_demographics(args.manifest, args.demographics_csv, tables)
+    else:
+        demographics = pd.read_csv(tables / "demographic_summary.csv")
 
     configure_style()
     plot_global(cells, global_summary, global_contrasts, figures, args.seed + 4)
@@ -920,14 +1079,21 @@ def build(args, out_dir: Path) -> dict:
     plot_logistic(logistic_models, logistic_predictions, logistic_coefficients, figures)
     plot_state_exploration(state_event, state_associations, figures, args.seed + 5)
     plot_pseudo(paired, did, match_balance, figures, args.seed + 6)
+    plot_subgroups(subgroup_cells, subgroup_contrasts, figures, args.seed + 7)
 
     counts = {"global_windows": len(global_frame), "state_windows": len(state_frame),
               "events": event.event_key.nunique(), "participants": event.participant.nunique(),
               "interictal_windows": int(global_frame.condition.eq("ii").sum()),
               "preictal_windows": int(global_frame.condition.eq("preict").sum()),
               "autonomic_complete_event_bins": int(event[list(MODEL_FEATURES)].notna().all(axis=1).sum()),
-              "matched_pseudo_pairs": len(paired)}
-    write_report(out_dir, global_summary, global_contrasts, logistic_models, did,
+              "matched_pseudo_pairs": len(paired),
+              "dd_paired_participants_final_minute": int(subgroup_contrasts[
+                  subgroup_contrasts.comparison.eq("DD paired FS minus ES") &
+                  subgroup_contrasts.time_bin.eq("-1 to 0")].n_paired.max()),
+              "fs_hypo_hyper_participants_final_minute": int(subgroup_contrasts[
+                  subgroup_contrasts.comparison.eq("FS hypo minus hyper") &
+                  subgroup_contrasts.time_bin.eq("-1 to 0")].n_participants.max())}
+    write_report(out_dir, global_summary, global_contrasts, subgroup_contrasts, demographics, logistic_models, did,
                  state_associations, manifold_audit, counts)
     summary = counts | {
         "strategy": "global transition grammar first; source states exploratory",
@@ -944,11 +1110,14 @@ def build(args, out_dir: Path) -> dict:
     audit = {
         "completed_utc": datetime.now(timezone.utc).isoformat(),
         "code": str(Path(__file__).resolve()), "code_sha256": sha256(Path(__file__)),
-        "inputs": {str(args.peak_windows_csv): sha256(args.peak_windows_csv),
-                   str(args.common_windows_csv): sha256(args.common_windows_csv)},
+        "inputs": {str(path): sha256(path) for path in
+                   (args.peak_windows_csv, args.common_windows_csv, args.manifest, args.demographics_csv)
+                   if path is not None},
         "estimands": {"global_js": "transition-count-weighted JS across six source grammars",
                       "global_kappa": "joint maximum-likelihood baseline-oriented concentration across six sources",
-                      "interictal_reference": "participant pooled II, leave-current-window-out for II rows"},
+                      "interictal_reference": "participant pooled II, leave-current-window-out for II rows",
+                      "dd_comparison": "paired participant mean FS minus ES within dual-event-type participants",
+                      "fs_semiology_comparison": "participant-semiology mean hypo minus hyper with participant-cluster bootstrap"},
         "minimum_transitions": args.minimum_transitions,
         "bootstrap_draws": args.bootstrap_draws,
         "random_seed": args.seed,
@@ -965,10 +1134,7 @@ def atomic_build(args) -> dict:
     target = args.out_dir.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}-building-", dir=target.parent))
-    backup = target.with_name(f".{target.name}-previous")
-    if backup.exists():
-        shutil.rmtree(temporary)
-        raise FileExistsError(f"Refusing overwrite because backup exists: {backup}")
+    backup = target.with_name(f".{target.name}-previous-{time.time_ns()}")
     try:
         summary = build(args, temporary)
         promote_directory(temporary, target, backup, args.overwrite)
@@ -1024,10 +1190,7 @@ def build_review_package(args) -> None:
         return
     target = args.review_dir.resolve(); target.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}-building-", dir=target.parent))
-    backup = target.with_name(f".{target.name}-previous")
-    if backup.exists():
-        shutil.rmtree(temporary)
-        raise FileExistsError(f"Refusing review overwrite because backup exists: {backup}")
+    backup = target.with_name(f".{target.name}-previous-{time.time_ns()}")
     try:
         (temporary / "code").mkdir(); (temporary / "input").mkdir()
         shutil.copy2(Path(__file__), temporary / "code" / Path(__file__).name)
@@ -1073,6 +1236,20 @@ def self_check() -> None:
     p = pd.Series([.04, .001, np.nan, .2])
     adjusted = bh(p)
     assert adjusted.iloc[1] <= adjusted.iloc[0] and pd.isna(adjusted.iloc[2])
+    subgroup_rows = []
+    for time_bin in TIME_BINS:
+        for participant, event_type, semiology, value in (
+                ("d1", "functional", "hypo", 3.), ("d1", "epileptic", "hyper", 2.),
+                ("d2", "functional", "hypo", 4.), ("d2", "epileptic", "hyper", 3.),
+                ("f1", "functional", "hypo", 3.), ("f2", "functional", "hypo", 4.),
+                ("f3", "functional", "hyper", 2.), ("f4", "functional", "hyper", 2.)):
+            subgroup_rows.append({"participant": participant, "event_key": participant + time_bin,
+                                  "cohort_group": "DD" if participant.startswith("d") else "FS",
+                                  "event_type": event_type, "semiology": semiology, "time_bin": time_bin,
+                                  "log_js": value, "log_kappa": value})
+    _, subgroup = subgroup_comparisons(pd.DataFrame(subgroup_rows), 100, 7)
+    assert np.allclose(subgroup[subgroup.comparison.eq("DD paired FS minus ES")].estimate, 1)
+    assert np.allclose(subgroup[subgroup.comparison.eq("FS hypo minus hyper")].estimate, 1.5)
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory); target = root / "target"; temporary = root / "temporary"
         target.mkdir(); temporary.mkdir(); (target / "old.txt").write_text("old")
@@ -1087,6 +1264,8 @@ def main() -> None:
     parser.add_argument("--peak-windows-csv", type=Path)
     parser.add_argument("--common-windows-csv", type=Path)
     parser.add_argument("--focused-dir", type=Path)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--demographics-csv", type=Path)
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--review-dir", type=Path)
     parser.add_argument("--minimum-transitions", type=int, default=MIN_TRANSITIONS)
@@ -1101,7 +1280,12 @@ def main() -> None:
     required = (args.peak_windows_csv, args.common_windows_csv, args.focused_dir, args.out_dir)
     if any(value is None for value in required):
         parser.error("--peak-windows-csv, --common-windows-csv, --focused-dir and --out-dir are required")
-    for path in (args.peak_windows_csv, args.common_windows_csv, args.focused_dir):
+    if (args.manifest is None) != (args.demographics_csv is None):
+        parser.error("--manifest and --demographics-csv must be supplied together")
+    for path in (args.peak_windows_csv, args.common_windows_csv, args.focused_dir,
+                 args.manifest, args.demographics_csv):
+        if path is None:
+            continue
         if not path.exists():
             parser.error(f"Input does not exist: {path}")
     if args.minimum_transitions != 30:
