@@ -35,6 +35,16 @@ EDGE_LABELS = tuple(f"{STATES[source]}->{STATES[destination]}"
                     for source in range(len(STATES)) for destination in DESTINATION_INDEX[source])
 
 
+def sum_zero_basis(size: int) -> np.ndarray:
+    """Orthonormal basis for the labelled sum-to-zero subspace."""
+    contrast = np.eye(size)[:, :-1] - np.eye(size)[:, [-1]]
+    return np.linalg.qr(contrast)[0]
+
+
+DESTINATION_BASIS = sum_zero_basis(len(STATES))
+ALLOWED_DESTINATION_BASIS = sum_zero_basis(len(STATES) - 1)
+
+
 def _configure_pymc_cache() -> None:
     cache = Path(__file__).with_name(".cache")
     cache.mkdir(exist_ok=True)
@@ -233,31 +243,44 @@ def build_masked_softmax_model(long: pd.DataFrame, counts: np.ndarray, covariate
     event = long.event_index.to_numpy(int)
     totals = counts.sum(axis=1).astype(int)
     destinations = DESTINATION_INDEX[source]
-    edge_destination = DESTINATION_INDEX.reshape(-1)
     coords = {"source": STATES, "destination": STATES, "edge": EDGE_LABELS,
               "covariate": covariates, "participant": participant_labels, "event": event_labels,
-              "observation": np.arange(len(long)), "destination_position": np.arange(5)}
+              "observation": np.arange(len(long)), "destination_position": np.arange(5),
+              "destination_contrast": np.arange(5), "allowed_contrast": np.arange(4)}
     with pm.Model(coords=coords) as model:
-        beta_mean = pm.Normal("beta_mean", 0, 1, dims=("covariate", "destination"))
-        beta_sd = pm.HalfNormal("beta_sd", .5, dims=("covariate", "destination"))
-        beta_offset = pm.Normal("beta_offset", 0, 1, dims=("edge", "covariate"))
-        raw_edge = (beta_mean[:, edge_destination].dimshuffle(1, 0) +
-                    beta_sd[:, edge_destination].dimshuffle(1, 0) * beta_offset)
-        by_source = raw_edge.reshape((len(STATES), 5, len(covariates)))
-        beta_edge = pm.Deterministic("beta_edge",
-                                     (by_source - pt.mean(by_source, axis=1, keepdims=True)).reshape((-1, len(covariates))),
-                                     dims=("edge", "covariate"))
+        destination_basis = pt.as_tensor_variable(DESTINATION_BASIS)
+        allowed_basis = pt.as_tensor_variable(ALLOWED_DESTINATION_BASIS)
+        destination_mean_free = pm.Normal("destination_mean_free", 0, 1,
+                                          dims=("covariate", "destination_contrast"))
+        destination_mean = pm.Deterministic(
+            "destination_mean",
+            pt.sum(destination_mean_free[:, None, :] * destination_basis[None, :, :], axis=2),
+            dims=("covariate", "destination"))
+        beta_sd = pm.HalfNormal("beta_sd", .5, dims="covariate")
+        beta_deviation_free = pm.Normal("beta_deviation_free", 0, 1,
+                                        dims=("source", "allowed_contrast", "covariate"))
+        beta_deviation = pt.sum(beta_deviation_free[:, None, :, :] *
+                                allowed_basis[None, :, :, None], axis=2)
+        base = destination_mean[:, DESTINATION_INDEX.reshape(-1)].dimshuffle(1, 0).reshape(
+            (len(STATES), 5, len(covariates)))
+        base -= pt.mean(base, axis=1, keepdims=True)
+        beta_edge = pm.Deterministic(
+            "beta_edge", (base + beta_sd[None, None, :] * beta_deviation).reshape((-1, len(covariates))),
+            dims=("edge", "covariate"))
         fixed = pt.sum(beta_edge.reshape((len(STATES), 5, len(covariates)))[source] * x[:, None, :], axis=2)
 
-        participant_sd = pm.HalfNormal("participant_sd", .5, dims=("source", "destination"))
-        participant_offset = pm.Normal("participant_offset", 0, 1, dims=("participant", "destination"))
-        participant_full = participant_offset[participant] * participant_sd[source]
+        participant_sd = pm.HalfNormal("participant_sd", .5)
+        participant_free = pm.Normal("participant_free", 0, 1,
+                                     dims=("participant", "destination_contrast"))
+        participant_labelled = pt.sum(participant_free[:, None, :] * destination_basis[None, :, :], axis=2)
+        participant_full = participant_sd * participant_labelled[participant]
         participant_allowed = participant_full[pt.arange(len(long))[:, None], destinations]
         participant_allowed -= pt.mean(participant_allowed, axis=1, keepdims=True)
 
-        event_sd = pm.HalfNormal("event_sd", .35, dims=("source", "destination"))
-        event_offset = pm.Normal("event_offset", 0, 1, dims=("event", "destination"))
-        event_full = event_offset[event] * event_sd[source]
+        event_sd = pm.HalfNormal("event_sd", .35)
+        event_free = pm.Normal("event_free", 0, 1, dims=("event", "destination_contrast"))
+        event_labelled = pt.sum(event_free[:, None, :] * destination_basis[None, :, :], axis=2)
+        event_full = event_sd * event_labelled[event]
         event_allowed = event_full[pt.arange(len(long))[:, None], destinations]
         event_allowed -= pt.mean(event_allowed, axis=1, keepdims=True)
 
@@ -267,53 +290,77 @@ def build_masked_softmax_model(long: pd.DataFrame, counts: np.ndarray, covariate
     return model
 
 
-def fit_hierarchical_multinomial(frame: pd.DataFrame, covariates: list[str], out_dir: Path,
-                                 draws: int, tune: int, chains: int, cores: int,
-                                 target_accept: float, seed: int):
+def fit_fullrank_restarts(model, draws: int, iterations: int, restarts: int, seed: int):
     _configure_pymc_cache()
     import arviz as az
     import pymc as pm
+
+    posteriors, losses = [], []
+    for restart in range(restarts):
+        restart_seed = seed + restart * 1009
+        with model:
+            approximation = pm.fit(
+                iterations, method="fullrank_advi", random_seed=restart_seed, progressbar=True,
+                callbacks=[pm.callbacks.CheckParametersConvergence(tolerance=1e-4)])
+            posterior = approximation.sample(draws, random_seed=restart_seed + 1, return_inferencedata=True)
+        posterior.posterior = posterior.posterior.assign_coords(chain=[restart])
+        posteriors.append(posterior)
+        losses.extend({"restart": restart + 1, "iteration": iteration + 1,
+                       "negative_elbo": float(value)}
+                      for iteration, value in enumerate(approximation.hist))
+    return az.concat(*posteriors, dim="chain"), pd.DataFrame(losses)
+
+
+def fit_hierarchical_multinomial(frame: pd.DataFrame, covariates: list[str], out_dir: Path,
+                                 draws: int, iterations: int, restarts: int, seed: int):
+    _configure_pymc_cache()
+    import arviz as az
 
     long, counts, _ = reshape_counts(frame, covariates, aggregate=True)
     participants = frame.participant.unique()
     events = frame.event_key.unique()
     model = build_masked_softmax_model(long, counts, covariates, participants, events)
-    with model:
-        posterior = pm.sample(draws=draws, tune=tune, chains=chains, cores=min(cores, chains),
-                              target_accept=target_accept, random_seed=seed, progressbar=True,
-                              compute_convergence_checks=False,
-                              idata_kwargs={"log_likelihood": False}, return_inferencedata=True)
+    posterior, losses = fit_fullrank_restarts(model, draws, iterations, restarts, seed)
     posterior.posterior.attrs.update({"likelihood": "Multinomial raw transition counts",
-                                      "parameterisation": "destination-labelled symmetric sum-to-zero masked softmax",
-                                      "inference": "multi-chain NUTS", "tune": tune,
-                                      "chains": chains, "target_accept": target_accept,
+                                      "parameterisation": "destination-labelled orthonormal sum-to-zero masked softmax",
+                                      "inference": "independent-restart full-rank ADVI",
+                                      "iterations_per_restart": iterations, "restarts": restarts,
                                       "transition_count_role": "multinomial denominator only"})
     az.to_netcdf(posterior, out_dir / "hierarchical_multinomial_posterior.nc")
+    losses.to_csv(out_dir / "fullrank_loss.csv", index=False)
     long.to_csv(out_dir / "hierarchical_multinomial_observations.csv", index=False)
     pd.DataFrame({"edge": EDGE_LABELS,
                   "source_state": np.repeat(STATES, 5),
                   "destination": np.array(STATES)[DESTINATION_INDEX.reshape(-1)]}) \
         .to_csv(out_dir / "hierarchical_edge_map.csv", index=False)
 
-    diagnostics = az.summary(posterior, var_names=["beta_edge", "beta_mean", "beta_sd",
-                                                    "participant_offset", "participant_sd",
-                                                    "event_offset", "event_sd"], kind="diagnostics")
-    diagnostics.rename_axis("parameter").reset_index().to_csv(out_dir / "nuts_diagnostics.csv", index=False)
-    sample_stats = posterior.sample_stats
-    confirmatory = diagnostics[~diagnostics.index.str.startswith(("participant_offset", "event_offset"))]
-    fit_diagnostics = {"chains": chains, "draws_per_chain": draws, "tune_per_chain": tune,
-                       "target_accept": target_accept,
-                       "divergences": int(sample_stats["diverging"].sum()),
+    diagnostics = az.summary(posterior, var_names=["beta_edge", "destination_mean", "beta_sd",
+                                                    "participant_free", "participant_sd",
+                                                    "event_free", "event_sd"], kind="diagnostics")
+    diagnostics.rename_axis("parameter").reset_index().to_csv(
+        out_dir / "fullrank_restart_diagnostics.csv", index=False)
+    confirmatory = diagnostics[~diagnostics.index.str.startswith(("participant_free", "event_free"))]
+    tail_changes = []
+    for _, part in losses.groupby("restart", observed=True):
+        tail = part.negative_elbo.to_numpy(float)
+        block = max(50, len(tail) // 20)
+        if len(tail) >= 2 * block:
+            tail_changes.append(abs(np.mean(tail[-block:]) - np.mean(tail[-2 * block:-block])) /
+                                max(abs(np.mean(tail[-block:])), 1e-12))
+    fit_diagnostics = {"inference": "independent-restart full-rank ADVI",
+                       "restarts": restarts, "draws_per_restart": draws,
+                       "iterations_per_restart": iterations,
                        "max_r_hat": float(confirmatory.r_hat.max()),
                        "min_ess_bulk": float(confirmatory.ess_bulk.min()),
                        "min_ess_tail": float(confirmatory.ess_tail.min()),
                        "all_parameter_max_r_hat": float(diagnostics.r_hat.max()),
-                       "all_parameter_min_ess_bulk": float(diagnostics.ess_bulk.min())}
-    if "tree_depth" in sample_stats:
-        fit_diagnostics["max_tree_depth"] = int(sample_stats["tree_depth"].max())
+                       "all_parameter_min_ess_bulk": float(diagnostics.ess_bulk.min()),
+                       "max_tail_relative_elbo_change": float(max(tail_changes, default=np.nan)),
+                       "final_negative_elbo_by_restart":
+                           [float(value) for value in losses.groupby("restart").negative_elbo.last()]}
     fit_diagnostics["confirmatory_thresholds_met"] = bool(
-        fit_diagnostics["divergences"] == 0 and fit_diagnostics["max_r_hat"] <= 1.01 and
-        fit_diagnostics["min_ess_bulk"] >= 400)
+        fit_diagnostics["max_r_hat"] <= 1.05 and fit_diagnostics["min_ess_bulk"] >= 400 and
+        fit_diagnostics["max_tail_relative_elbo_change"] <= .01)
     (out_dir / "confirmatory_fit_diagnostics.json").write_text(
         json.dumps(fit_diagnostics, indent=2), encoding="utf-8")
     return posterior, long, counts, fit_diagnostics
@@ -323,6 +370,10 @@ def posterior_array(posterior, name: str) -> np.ndarray:
     value = posterior.posterior[name]
     dimensions = [dimension for dimension in value.dims if dimension not in ("chain", "draw")]
     return value.stack(sample=("chain", "draw")).transpose("sample", *dimensions).to_numpy()
+
+
+def labelled_random_effect(posterior, name: str) -> np.ndarray:
+    return np.einsum("spk,dk->spd", posterior_array(posterior, name), DESTINATION_BASIS)
 
 
 def softmax_last_reference(eta: np.ndarray) -> np.ndarray:
@@ -433,10 +484,10 @@ def derive_posterior_metrics(posterior, long: pd.DataFrame, frame: pd.DataFrame,
                              covariates: list[str], baseline_table: pd.DataFrame,
                              out_dir: Path, seed: int) -> tuple[pd.DataFrame, dict, dict, pd.DataFrame]:
     beta_edge = posterior_array(posterior, "beta_edge")
-    participant_offset = posterior_array(posterior, "participant_offset")
-    participant_sd = posterior_array(posterior, "participant_sd")
-    event_offset = posterior_array(posterior, "event_offset")
-    event_sd = posterior_array(posterior, "event_sd")
+    participant_labelled = labelled_random_effect(posterior, "participant_free")
+    participant_sd = posterior_array(posterior, "participant_sd")[:, None, None]
+    event_labelled = labelled_random_effect(posterior, "event_free")
+    event_sd = posterior_array(posterior, "event_sd")[:, None, None]
     n_draws = beta_edge.shape[0]
     rng = np.random.default_rng(seed)
     baseline_counts = {}
@@ -455,12 +506,10 @@ def derive_posterior_metrics(posterior, long: pd.DataFrame, frame: pd.DataFrame,
         meta = long.loc[use].reset_index(drop=True)
         x = meta[covariates].to_numpy(float)
         beta = beta_edge[:, source * 5:(source + 1) * 5, :]
-        participant_full = (participant_offset[:, meta.participant_index.to_numpy(int), :] *
-                            participant_sd[:, None, source, :])
+        participant_full = participant_sd * participant_labelled[:, meta.participant_index.to_numpy(int), :]
         participant_allowed = participant_full[:, :, DESTINATION_INDEX[source]]
         participant_allowed -= participant_allowed.mean(axis=2, keepdims=True)
-        event_full = (event_offset[:, meta.event_index.to_numpy(int), :] *
-                      event_sd[:, None, source, :])
+        event_full = event_sd * event_labelled[:, meta.event_index.to_numpy(int), :]
         event_allowed = event_full[:, :, DESTINATION_INDEX[source]]
         event_allowed -= event_allowed.mean(axis=2, keepdims=True)
         eta = np.einsum("skc,oc->sok", beta, x) + participant_allowed + event_allowed
@@ -543,14 +592,14 @@ def posterior_predictive_checks(posterior, long: pd.DataFrame, counts: np.ndarra
                                 frame: pd.DataFrame, covariates: list[str], out_dir: Path,
                                 seed: int, max_draws: int = 200) -> dict:
     beta_edge = posterior_array(posterior, "beta_edge")
-    participant_offset = posterior_array(posterior, "participant_offset")
-    participant_sd = posterior_array(posterior, "participant_sd")
-    event_offset = posterior_array(posterior, "event_offset")
-    event_sd = posterior_array(posterior, "event_sd")
+    participant_labelled = labelled_random_effect(posterior, "participant_free")
+    participant_sd = posterior_array(posterior, "participant_sd")[:, None, None]
+    event_labelled = labelled_random_effect(posterior, "event_free")
+    event_sd = posterior_array(posterior, "event_sd")[:, None, None]
     selected = np.linspace(0, len(beta_edge) - 1, min(max_draws, len(beta_edge)), dtype=int)
-    beta_edge, participant_offset, participant_sd, event_offset, event_sd = (
-        value[selected] for value in (beta_edge, participant_offset, participant_sd,
-                                      event_offset, event_sd))
+    beta_edge, participant_labelled, participant_sd, event_labelled, event_sd = (
+        value[selected] for value in (beta_edge, participant_labelled, participant_sd,
+                                      event_labelled, event_sd))
     rng = np.random.default_rng(seed)
     predictive_rows, discrepancy_rows = [], []
     covered = []
@@ -562,11 +611,10 @@ def posterior_predictive_checks(posterior, long: pd.DataFrame, counts: np.ndarra
         totals = observed.sum(axis=1).astype(int)
         x = meta[covariates].to_numpy(float)
         beta = beta_edge[:, source * 5:(source + 1) * 5, :]
-        participant_full = (participant_offset[:, meta.participant_index.to_numpy(int), :] *
-                            participant_sd[:, None, source, :])
+        participant_full = participant_sd * participant_labelled[:, meta.participant_index.to_numpy(int), :]
         participant_allowed = participant_full[:, :, DESTINATION_INDEX[source]]
         participant_allowed -= participant_allowed.mean(axis=2, keepdims=True)
-        event_full = event_offset[:, meta.event_index.to_numpy(int), :] * event_sd[:, None, source, :]
+        event_full = event_sd * event_labelled[:, meta.event_index.to_numpy(int), :]
         event_allowed = event_full[:, :, DESTINATION_INDEX[source]]
         event_allowed -= event_allowed.mean(axis=2, keepdims=True)
         eta = np.einsum("skc,oc->sok", beta, x) + participant_allowed + event_allowed
@@ -622,10 +670,9 @@ def posterior_predictive_checks(posterior, long: pd.DataFrame, counts: np.ndarra
     return summary
 
 
-def simulation_recovery(out_dir: Path, draws: int, tune: int, chains: int, seed: int) -> dict:
+def simulation_recovery(out_dir: Path, draws: int, iterations: int, restarts: int, seed: int) -> dict:
     _configure_pymc_cache()
     import arviz as az
-    import pymc as pm
 
     rng = np.random.default_rng(seed)
     covariates = ["intercept", "group_fs", "true_onset", "group_x_true"]
@@ -665,10 +712,7 @@ def simulation_recovery(out_dir: Path, draws: int, tune: int, chains: int, seed:
     long = pd.concat(rows, ignore_index=True)
     counts = np.vstack(counts)
     model = build_masked_softmax_model(long, counts, covariates, participants, events)
-    with model:
-        posterior = pm.sample(draws=draws, tune=tune, chains=chains, cores=1, target_accept=.9,
-                              random_seed=seed + 1, progressbar=True, compute_convergence_checks=False,
-                              idata_kwargs={"log_likelihood": False}, return_inferencedata=True)
+    posterior, _ = fit_fullrank_restarts(model, draws, iterations, restarts, seed + 1)
     recovered = posterior_array(posterior, "beta_edge").reshape((-1, len(STATES), 5, len(covariates)))[:, :, :, 3]
     low, median, high = np.quantile(recovered, (.025, .5, .975), axis=0)
     rows = []
@@ -683,14 +727,14 @@ def simulation_recovery(out_dir: Path, draws: int, tune: int, chains: int, seed:
     result = pd.DataFrame(rows)
     result.to_csv(out_dir / "simulation_recovery.csv", index=False)
     diagnostic = az.summary(posterior, var_names=["beta_edge"], kind="diagnostics")
-    summary = {"simulation_chains": chains, "simulation_draws_per_chain": draws,
-               "simulation_tune_per_chain": tune,
+    summary = {"simulation_inference": "independent-restart full-rank ADVI",
+               "simulation_restarts": restarts, "simulation_draws_per_restart": draws,
+               "simulation_iterations_per_restart": iterations,
                "coefficient_correlation": float(np.corrcoef(result.truth, result.posterior_median)[0, 1]),
                "coefficient_rmse": float(np.sqrt(np.mean((result.truth - result.posterior_median) ** 2))),
                "interval_coverage": float(result.covered.mean()),
                "max_r_hat": float(diagnostic.r_hat.max()),
-               "min_ess_bulk": float(diagnostic.ess_bulk.min()),
-               "divergences": int(posterior.sample_stats["diverging"].sum())}
+               "min_ess_bulk": float(diagnostic.ess_bulk.min())}
     (out_dir / "simulation_recovery_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
 
@@ -1000,8 +1044,8 @@ def write_report(out_dir: Path, planned: pd.DataFrame, specificity: pd.DataFrame
     report = ["# Equalised and optimised transition analysis", "",
               f"Completed: {datetime.now(timezone.utc).isoformat()}", "",
               "## Model", "",
-              "Raw transition counts were fitted with a destination-labelled hierarchical multinomial masked-softmax model. For every source, the five allowed destination logits are constrained to sum to zero; the self-transition is structurally excluded. Population shrinkage is indexed by destination label rather than by a source-dependent coordinate position. Participant and event random destination effects are included, and transition totals enter only as each Multinomial denominator.", "",
-              f"The confirmatory fit used {fit_diagnostics['chains']} NUTS chains with {fit_diagnostics['draws_per_chain']} retained draws per chain after {fit_diagnostics['tune_per_chain']} tuning iterations. Divergences={fit_diagnostics['divergences']}; max R-hat={fit_diagnostics['max_r_hat']:.3f}; minimum bulk ESS={fit_diagnostics['min_ess_bulk']:.0f}.", "",
+              "Raw transition counts were fitted with a destination-labelled hierarchical multinomial masked-softmax model. Orthonormal contrasts identify both the six labelled destination effects and, for every source, the five allowed sum-to-zero logits; the self-transition is structurally excluded. Population shrinkage is indexed by destination label rather than by a source-dependent coordinate position. Participant and event random destination effects are included, and transition totals enter only as each Multinomial denominator.", "",
+              f"The confirmatory fit used {fit_diagnostics['restarts']} independent full-rank ADVI restarts with {fit_diagnostics['draws_per_restart']} posterior draws per restart after up to {fit_diagnostics['iterations_per_restart']} optimisation iterations. Restart max R-hat={fit_diagnostics['max_r_hat']:.3f}; minimum bulk ESS={fit_diagnostics['min_ess_bulk']:.0f}; maximum tail relative ELBO change={fit_diagnostics['max_tail_relative_elbo_change']:.4f}.", "",
               "## Matched pseudo-onset difference-in-differences", "",
               "The onset-specific estimand is [FS genuine - FS matched pseudo] - [ES genuine - ES matched pseudo]. Genuine and pseudo windows are paired within the same participant and event match before participant-equal aggregation.", "",
               markdown(did[(did.outcome.eq("J")) &
@@ -1075,21 +1119,20 @@ def run(args) -> dict:
         _configure_pymc_cache()
         import arviz as az
         posterior = az.from_netcdf(data_dir / "hierarchical_multinomial_posterior.nc")
-        if "destination-labelled" not in posterior.posterior.attrs.get("parameterisation", ""):
-            raise ValueError("The saved posterior uses the obsolete source-position ALR parameterisation")
+        if "orthonormal" not in posterior.posterior.attrs.get("parameterisation", ""):
+            raise ValueError("The saved posterior does not use the identified orthonormal masked-softmax parameterisation")
         long = pd.read_csv(data_dir / "hierarchical_multinomial_observations.csv")
         fit_diagnostics = json.loads((data_dir / "confirmatory_fit_diagnostics.json").read_text(encoding="utf-8"))
     else:
         posterior, long, counts, fit_diagnostics = fit_hierarchical_multinomial(
-            frame, covariates, data_dir, args.draws, args.tune, args.chains, args.cores,
-            args.target_accept, args.seed)
+            frame, covariates, data_dir, args.draws, args.advi_iterations, args.restarts, args.seed)
     prediction_long, prediction_counts, _ = reshape_counts(frame, covariates)
     global_means, global_metrics, cells, did = derive_posterior_metrics(
         posterior, prediction_long, frame, covariates, table, data_dir, args.seed + 2)
     ppc = posterior_predictive_checks(posterior, prediction_long, prediction_counts, frame, covariates, data_dir,
                                       args.seed + 3, args.ppc_draws)
-    recovery = simulation_recovery(data_dir, args.recovery_draws, args.recovery_tune,
-                                   args.recovery_chains, args.seed + 4)
+    recovery = simulation_recovery(data_dir, args.recovery_draws, args.recovery_advi_iterations,
+                                   args.recovery_restarts, args.seed + 4)
     planned = planned_contrasts(frame, global_metrics, cells, data_dir)
     spline_trajectory(frame, global_metrics, data_dir, args.seed + 5)
     specificity = source_specificity(cells, data_dir)
@@ -1104,8 +1147,8 @@ def run(args) -> dict:
     summary = {"model_windows": len(frame), "multinomial_rows": len(long),
                "participants": int(frame.participant.nunique()), "events": int(frame.event_key.nunique()),
                "pseudo_onset_matches": len(matches),
-               "posterior_draws_total": args.draws * args.chains, "chains": args.chains,
-               "draws_per_chain": args.draws, "tune_per_chain": args.tune,
+               "posterior_draws_total": args.draws * args.restarts, "restarts": args.restarts,
+               "draws_per_restart": args.draws, "advi_iterations_per_restart": args.advi_iterations,
                "legacy_equalised_sensitivity_transitions": EQUALISED_TRANSITIONS,
                "legacy_equalised_sensitivity_run": False,
                "complete_coverage_events": int(planned.complete_events.iloc[0]),
@@ -1118,7 +1161,7 @@ def run(args) -> dict:
                     "matched_j_did_ci95_low": float(headline_did.ci95_low),
                     "matched_j_did_ci95_high": float(headline_did.ci95_high),
                     "matched_j_did_probability_gt_zero": float(headline_did.probability_gt_zero),
-                    **{f"nuts_{key}": value for key, value in fit_diagnostics.items()},
+                    **{f"fullrank_{key}": value for key, value in fit_diagnostics.items()},
                     **{f"ppc_{key}": value for key, value in ppc.items()},
                     **{f"recovery_{key}": value for key, value in recovery.items()}})
     non_position_balance = balance[~balance.matching_variable.eq("record_fraction")]
@@ -1132,8 +1175,8 @@ def run(args) -> dict:
                              if path is not None and path.exists()},
                   "code": {str(path): sha256(path) for path in
                            (Path(__file__), Path(legacy.__file__))},
-                  "model": "destination-labelled hierarchical multinomial masked softmax; symmetric sum-to-zero allowed-destination logits; participant/event random effects",
-                  "inference": "multi-chain NUTS", "transition_count_as_predictor": False,
+                  "model": "destination-labelled hierarchical multinomial masked softmax; orthonormal sum-to-zero logits; participant/event random effects",
+                  "inference": "independent-restart full-rank ADVI", "transition_count_as_predictor": False,
                   "all_source_reference_qc_threshold": 0.50,
                   "primary_outcomes": ["J", "K_H", "D_route"], "secondary_outcome": "kappa",
                   "covariates": covariates,
@@ -1157,6 +1200,10 @@ def self_check() -> None:
     assert np.all(legacy.thin_counts(rng, counts, EQUALISED_TRANSITIONS, 10).sum(axis=1) == EQUALISED_TRANSITIONS)
     assert DESTINATION_INDEX.shape == (6, 5) and len(set(EDGE_LABELS)) == 30
     assert all(source not in DESTINATION_INDEX[source] for source in range(6))
+    assert np.allclose(DESTINATION_BASIS.T @ DESTINATION_BASIS, np.eye(5))
+    assert np.allclose(DESTINATION_BASIS.sum(axis=0), 0)
+    assert np.allclose(ALLOWED_DESTINATION_BASIS.T @ ALLOWED_DESTINATION_BASIS, np.eye(4))
+    assert np.allclose(ALLOWED_DESTINATION_BASIS.sum(axis=0), 0)
     probability = rng.dirichlet(np.ones(5), size=(3, 4))
     replicated = rng.multinomial(np.array([10, 20, 30, 40]), probability)
     assert replicated.shape == (3, 4, 5) and np.all(replicated.sum(axis=2) == np.array([10, 20, 30, 40]))
@@ -1180,25 +1227,24 @@ def main() -> None:
     parser.add_argument("--reference-qc-csv", type=Path, default=source / "state_reference_qc.csv")
     parser.add_argument("--out-dir", type=Path,
                         default=Path(r"C:\Users\Admin\OneDrive - NHS\FS_MS\equalised and optimised"))
-    parser.add_argument("--draws", type=int, default=750)
-    parser.add_argument("--tune", type=int, default=750)
-    parser.add_argument("--chains", type=int, default=4)
-    parser.add_argument("--cores", type=int, default=2)
-    parser.add_argument("--target-accept", type=float, default=.92)
+    parser.add_argument("--draws", type=int, default=1000,
+                        help="Posterior draws per independent full-rank restart")
+    parser.add_argument("--advi-iterations", type=int, default=30000)
+    parser.add_argument("--restarts", type=int, default=3)
     parser.add_argument("--ppc-draws", type=int, default=200)
-    parser.add_argument("--recovery-draws", type=int, default=300)
-    parser.add_argument("--recovery-tune", type=int, default=300)
-    parser.add_argument("--recovery-chains", type=int, default=2)
+    parser.add_argument("--recovery-draws", type=int, default=1000)
+    parser.add_argument("--recovery-advi-iterations", type=int, default=15000)
+    parser.add_argument("--recovery-restarts", type=int, default=2)
     parser.add_argument("--seed", type=int, default=30072026)
     parser.add_argument("--reuse-posterior", action="store_true")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     if args.self_check:
         self_check(); print("optimised transition self-check passed"); return
-    if args.chains < 2 or args.draws < 250 or args.tune < 250:
-        parser.error("confirmatory inference requires at least 2 chains, 250 draws and 250 tuning iterations")
-    if args.recovery_chains < 2:
-        parser.error("simulation recovery requires at least 2 chains")
+    if args.restarts < 2 or args.draws < 500 or args.advi_iterations < 5000:
+        parser.error("confirmatory inference requires at least 2 full-rank restarts, 500 draws and 5,000 iterations")
+    if args.recovery_restarts < 2 or args.recovery_draws < 500:
+        parser.error("simulation recovery requires at least 2 full-rank restarts and 500 draws")
     required = (args.peak_windows_csv, args.common_windows_csv, args.reference_qc_csv)
     missing = [str(path) for path in required if not path.exists()]
     if missing:

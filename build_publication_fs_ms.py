@@ -52,7 +52,8 @@ PRIMARY_TABLES = (
     "posterior_destination_changes.csv", "interictal_autonomic_pca_loadings.csv",
     "lagged_autonomic_factor_tests.csv", "dynamic_loop_coefficients.csv",
     "dynamic_loop_model_comparison.csv", "pseudo_onset_match_balance.csv",
-    "matched_pseudo_difference_in_differences.csv", "nuts_diagnostics.csv",
+    "matched_pseudo_difference_in_differences.csv", "fullrank_restart_diagnostics.csv",
+    "fullrank_loss.csv",
     "posterior_predictive_checks.csv", "posterior_predictive_discrepancy.csv",
     "simulation_recovery.csv", "confirmatory_fit_diagnostics.json",
     "simulation_recovery_summary.json", "pseudo_onset_covariate_availability.json", "summary.json",
@@ -516,14 +517,17 @@ def build(args) -> dict:
                     did.contrast.eq("matched difference-in-differences")].iloc[0]
     best = loop[loop.outcome.eq("all")].sort_values("elpd", ascending=False).iloc[0]
     overall_recovery = recovery[recovery.contrast.str.startswith("Overall")].iloc[0]
+    consolidation_text = ("supported" if consolidate.probability_gt_zero >= .975 else "not established")
+    equivalence_text = ("supported" if stable.probability_in_rope >= .95 else "not established")
+    validation_text = ("met" if fit_diagnostics["confirmatory_thresholds_met"] else "did not meet")
     report = [
         "# Publication analysis: retained physiology plus optimised transition model", "",
         "This report is deliberately non-duplicative. The hierarchical multinomial model replaces the legacy transition, route, specificity, autonomic-association and pairwise flow analyses. Cohort context, heart rate, coverage, autonomic levels and postictal recovery remain because they answer distinct questions.", "",
         "## Analysis decisions", "", markdown_table(decisions, list(decisions.columns)), "",
         "## Primary transition findings", "",
         f"- Early FS baseline-oriented concentration was lower than ES: median contrast {early['median']:.4g} (95% CrI {early.ci95_low:.4g} to {early.ci95_high:.4g}); P(<0)={early.probability_lt_zero:.3f}.",
-        f"- Complete-coverage events did not establish later FS consolidation: median late-minus-early κ {consolidate['median']:.4g} (95% CrI {consolidate.ci95_low:.4g} to {consolidate.ci95_high:.4g}); P(>0)={consolidate.probability_gt_zero:.3f}.",
-        f"- FS divergence remained within the prespecified ±0.02 J equivalence region with probability {stable.probability_in_rope:.3f}.",
+        f"- Complete-coverage later FS consolidation was {consolidation_text}: median late-minus-early κ {consolidate['median']:.4g} (95% CrI {consolidate.ci95_low:.4g} to {consolidate.ci95_high:.4g}); P(>0)={consolidate.probability_gt_zero:.3f}.",
+        f"- Early-to-final FS J equivalence was {equivalence_text}: posterior probability within the prespecified ±0.02 region={stable.probability_in_rope:.3f}.",
         f"- Matched onset-specific J difference-in-differences: median {onset_did['median']:.4g} (95% CrI {onset_did.ci95_low:.4g} to {onset_did.ci95_high:.4g}); P(>0)={onset_did.probability_gt_zero:.3f}.",
         f"- C specificity was not established: P(C-source J effect > mean other-source effects)={c_specific.probability_gt_zero:.3f}. The final-minute effect is distributed across sources.", "",
         "![Transition trajectories](figures/figure_03_transition_trajectories.png)", "",
@@ -539,7 +543,7 @@ def build(args) -> dict:
         ("This contrast supports onset specificity beyond the FS-associated phenotype."
          if onset_did.probability_gt_zero >= .975 or onset_did.probability_lt_zero >= .975 else
          "This contrast does not establish onset specificity; the evidence supports an FS-associated transition phenotype, not an onset-specific biomarker."),
-        f"The destination-labelled symmetric masked-softmax model used {fit_diagnostics['chains']} NUTS chains × {fit_diagnostics['draws_per_chain']} retained draws. Divergences={fit_diagnostics['divergences']}; max R-hat={fit_diagnostics['max_r_hat']:.3f}; minimum bulk ESS={fit_diagnostics['min_ess_bulk']:.0f}. Posterior-predictive cell coverage={ppc_coverage:.3f}; simulation-recovery coefficient correlation={recovery_diagnostics['coefficient_correlation']:.3f}.", "",
+        f"The destination-labelled orthonormal sum-to-zero masked-softmax model used {fit_diagnostics['restarts']} independent full-rank ADVI restarts × {fit_diagnostics['draws_per_restart']} posterior draws. The confirmatory thresholds {validation_text}: restart max R-hat={fit_diagnostics['max_r_hat']:.3f}; minimum bulk ESS={fit_diagnostics['min_ess_bulk']:.0f}; maximum tail relative ELBO change={fit_diagnostics['max_tail_relative_elbo_change']:.4f}. Posterior-predictive cell coverage={ppc_coverage:.3f}; simulation-recovery coefficient correlation={recovery_diagnostics['coefficient_correlation']:.3f}.", "",
         "![Matched onset specificity and balance](figures/figure_08_pseudo_onset_balance.png)", "",
         "## Qualitative κ–J–CPI geometry", "",
         "The matched 3D views use identical axes for FS and ES. Points are event-by-time-bin means with small deterministic display jitter; colour is minutes before onset, and the black-diamond path joins time-bin medians. Log transforms preserve the strongly skewed positive J and κ axes; CPI tick labels remain in within-person z units. These plots are descriptive, not additional hypothesis tests.", "",
@@ -559,8 +563,8 @@ def build(args) -> dict:
         "focused_source": str(args.focused_dir), "optimised_source": str(args.optimised_dir),
         "legacy_equalised_sensitivity_transitions": 30,
         "primary_model_uses_raw_transition_totals": True,
-        "parameterisation": "destination-labelled symmetric sum-to-zero masked softmax",
-        "inference": "multi-chain NUTS", "primary_outcomes": ["J", "K_H", "D_route"],
+        "parameterisation": "destination-labelled orthonormal sum-to-zero masked softmax",
+        "inference": "independent-restart full-rank ADVI", "primary_outcomes": ["J", "K_H", "D_route"],
         "secondary_outcome": "kappa", "figures_png": len(list(figures.glob("*.png"))),
         "figures_pdf": len(list(figures.glob("*.pdf"))), "three_d_display_jitter_seeded": True,
         "three_d_transforms": {"J": "log10", "kappa": "log10", "CPI_z": "asinh(CPI_z/2) with raw-unit ticks"},
@@ -579,10 +583,9 @@ def build(args) -> dict:
                "matched_j_did_median": float(onset_did["median"]),
                "matched_j_did_ci95": [float(onset_did.ci95_low), float(onset_did.ci95_high)],
                "matched_j_did_probability_gt_zero": float(onset_did.probability_gt_zero),
-               "nuts_chains": int(fit_diagnostics["chains"]),
-               "nuts_draws_per_chain": int(fit_diagnostics["draws_per_chain"]),
-               "nuts_divergences": int(fit_diagnostics["divergences"]),
-               "nuts_max_r_hat": float(fit_diagnostics["max_r_hat"]),
+               "fullrank_restarts": int(fit_diagnostics["restarts"]),
+               "fullrank_draws_per_restart": int(fit_diagnostics["draws_per_restart"]),
+               "fullrank_max_r_hat": float(fit_diagnostics["max_r_hat"]),
                "ppc_cell_coverage": ppc_coverage,
                "simulation_recovery_correlation": float(recovery_diagnostics["coefficient_correlation"]),
                "best_dynamic_model": str(best.model)}
