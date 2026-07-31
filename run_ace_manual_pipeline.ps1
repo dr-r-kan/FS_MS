@@ -136,6 +136,10 @@ try {
         (Join-Path $OptimisedAnalysis 'data\summary.json'),
         (Join-Path $OptimisedAnalysis 'data\hierarchical_multinomial_posterior.nc'),
         (Join-Path $OptimisedAnalysis 'data\planned_early_late_contrasts.csv'),
+        (Join-Path $OptimisedAnalysis 'data\matched_pseudo_difference_in_differences.csv'),
+        (Join-Path $OptimisedAnalysis 'data\confirmatory_fit_diagnostics.json'),
+        (Join-Path $OptimisedAnalysis 'data\posterior_predictive_checks.csv'),
+        (Join-Path $OptimisedAnalysis 'data\simulation_recovery.csv'),
         (Join-Path $OptimisedAnalysis 'data\dynamic_loop_model_comparison.csv')) {
         & $Python -B analyse_optimised_transition_model.py `
             --peak-windows-csv $PeakWindows `
@@ -149,11 +153,13 @@ try {
         (Join-Path $PublicationAnalysis 'RESULTS.md'),
         (Join-Path $PublicationAnalysis 'PUBLICATION_AUDIT.json'),
         (Join-Path $PublicationAnalysis 'ANALYSIS_DECISIONS.csv'),
+        (Join-Path $PublicationAnalysis 'tables\matched_pseudo_difference_in_differences.csv'),
+        (Join-Path $PublicationAnalysis 'tables\confirmatory_fit_diagnostics.json'),
         (Join-Path $PublicationAnalysis 'figures\figure_03_transition_trajectories.png'),
         (Join-Path $PublicationAnalysis 'figures\figure_09_fs_kappa_js_cpi_3d.png'),
         (Join-Path $PublicationAnalysis 'figures\figure_10_es_kappa_js_cpi_3d.png')) {
         & $Python -B build_publication_fs_ms.py --focused-dir $Analysis `
-            --optimised-dir $OptimisedAnalysis --out-dir $PublicationAnalysis
+            --optimised-dir $OptimisedAnalysis --out-dir $PublicationAnalysis --overwrite
     }
     $State.result='completed'
 } catch {

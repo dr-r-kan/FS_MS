@@ -52,7 +52,10 @@ PRIMARY_TABLES = (
     "posterior_destination_changes.csv", "interictal_autonomic_pca_loadings.csv",
     "lagged_autonomic_factor_tests.csv", "dynamic_loop_coefficients.csv",
     "dynamic_loop_model_comparison.csv", "pseudo_onset_match_balance.csv",
-    "pseudo_onset_covariate_availability.json", "summary.json",
+    "matched_pseudo_difference_in_differences.csv", "nuts_diagnostics.csv",
+    "posterior_predictive_checks.csv", "posterior_predictive_discrepancy.csv",
+    "simulation_recovery.csv", "confirmatory_fit_diagnostics.json",
+    "simulation_recovery_summary.json", "pseudo_onset_covariate_availability.json", "summary.json",
 )
 
 
@@ -338,20 +341,43 @@ def plot_dynamic_models(data: Path, figures: Path) -> None:
 
 
 def plot_balance(data: Path, figures: Path) -> None:
-    frame = pd.read_csv(data / "pseudo_onset_match_balance.csv")
-    main = frame[~frame.matching_variable.eq("record_fraction")].sort_values("standardised_mean_difference")
-    position = frame[frame.matching_variable.eq("record_fraction")]
-    fig, axes = plt.subplots(1, 2, figsize=(7.4, 3.7), layout="constrained", gridspec_kw={"width_ratios": (3.4, 1)})
-    for ax, part, title, letter in ((axes[0], main, "Matched measurement balance", "A"),
-                                    (axes[1], position, "Designed record-position restriction", "B")):
-        labels = [name.replace("_", " ").replace("n ", "count: ") for name in part.matching_variable]
-        y = np.arange(len(part)); values = part.standardised_mean_difference.to_numpy(float)
-        colors = np.where(np.abs(values) <= .1, ACCENT, np.where(np.abs(values) <= .25, PURPLE, ES_COLOR))
-        ax.hlines(y, 0, values, color=colors, lw=1.3); ax.scatter(values, y, color=colors, s=28, zorder=3)
-        ax.axvline(0, color=GREY, lw=.8); ax.axvspan(-.1, .1, color=ACCENT, alpha=.08)
-        ax.set(yticks=y, yticklabels=labels, xlabel="Standardised mean difference\n(true − pseudo)", title=title)
-        ax.grid(axis="x"); panel(ax, letter)
-    axes[0].set_xlim(-.35, .15); axes[1].set_xlim(0, 1.4)
+    did = pd.read_csv(data / "matched_pseudo_difference_in_differences.csv")
+    order = ("Global", *STATES)
+    effect = (did[did.outcome.eq("J") & did.contrast.eq("matched difference-in-differences")]
+              .set_index("source_state").reindex(order).dropna().reset_index())
+    balance = pd.read_csv(data / "pseudo_onset_match_balance.csv")
+    main = balance[~balance.matching_variable.eq("record_fraction")].sort_values("standardised_mean_difference")
+    position = balance[balance.matching_variable.eq("record_fraction")].iloc[0]
+    fig, axes = plt.subplots(1, 2, figsize=(7.5, 3.7), layout="constrained",
+                             gridspec_kw={"width_ratios": (1.15, 1.55)})
+
+    y = np.arange(len(effect)); middle = effect["median"].to_numpy(float)
+    colors = [PURPLE if state == "Global" else (ES_COLOR if state == "C" else FS_COLOR)
+              for state in effect.source_state]
+    for yi, row, color in zip(y, effect.itertuples(), colors):
+        axes[0].errorbar(row.median, yi,
+                         xerr=[[row.median - row.ci95_low], [row.ci95_high - row.median]],
+                         fmt="o", color=color, capsize=2.5, ms=5)
+    axes[0].axvline(0, color=GREY, lw=.8)
+    axes[0].set(yticks=y, yticklabels=effect.source_state,
+                xlabel="[FS genuine − pseudo] −\n[ES genuine − pseudo] in J",
+                title="Matched onset-specific contrast")
+    axes[0].invert_yaxis(); axes[0].grid(axis="x"); panel(axes[0], "A")
+
+    labels = [name.replace("_", " ").replace("n ", "count: ") for name in main.matching_variable]
+    y = np.arange(len(main)); values = main.standardised_mean_difference.to_numpy(float)
+    colors = np.where(np.abs(values) <= .1, ACCENT, np.where(np.abs(values) <= .25, PURPLE, ES_COLOR))
+    axes[1].hlines(y, 0, values, color=colors, lw=1.3)
+    axes[1].scatter(values, y, color=colors, s=28, zorder=3)
+    axes[1].axvline(0, color=GREY, lw=.8); axes[1].axvspan(-.1, .1, color=ACCENT, alpha=.08)
+    axes[1].set(yticks=y, yticklabels=labels,
+                xlabel="Standardised mean difference (true − pseudo)",
+                title="Within-participant matching balance")
+    axes[1].text(.99, -.16,
+                 f"Record-position SMD = {position.standardised_mean_difference:.2f} (design restriction)",
+                 transform=axes[1].transAxes, ha="right", va="top", color=GREY, fontsize=7)
+    axes[1].set_xlim(min(-.35, values.min() - .03), max(.15, values.max() + .03))
+    axes[1].grid(axis="x"); panel(axes[1], "B")
     save_figure(fig, figures, FIGURES[7])
 
 
@@ -430,11 +456,11 @@ def analysis_decisions() -> pd.DataFrame:
         ("Postictal recovery", "retain secondary", "Not included in the preictal hierarchy", "Retained paired recovery model"),
         ("Legacy C-origin JS/kappa models", "replace", "Superseded by joint count likelihood and posterior-derived metrics", "Hierarchical multinomial model"),
         ("Raw-count/fixed-exit sensitivities", "replace", "Count uncertainty now enters the multinomial likelihood directly", "Hierarchical multinomial model; N=30 sensitivity retained in audit"),
-        ("Pairwise C-specificity tests", "replace", "Multiplicity and shrinkage handled hierarchically", "P(beta_C > mean beta_other)"),
+        ("Pairwise C-specificity tests", "replace", "Multiplicity and shrinkage handled hierarchically", "P(C-source J effect > mean other-source effects)"),
         ("Legacy route/destination tests", "replace", "Routes and destinations are derived coherently from one posterior", "J, K_H, D_route and destination changes"),
         ("Legacy autonomic kitchen-sink models", "replace", "Correlated inputs reduced interictally", "Three orthogonal autonomic PCs"),
         ("Legacy predictive-flow forest", "replace", "Redundant pairwise lag models", "Five-model joint dynamic comparison"),
-        ("Legacy pseudo-onset comparison", "replace", "True/pseudo onset is in the hierarchical model", "Matched pseudo-onsets plus balance audit"),
+        ("Legacy pseudo-onset comparison", "replace", "Unpaired genuine and pseudo contrasts do not test onset specificity", "Matched FS/ES genuine-pseudo difference-in-differences"),
     ], columns=["analysis", "decision", "reason", "publication_replacement"])
 
 
@@ -474,6 +500,11 @@ def build(args) -> dict:
 
     planned = pd.read_csv(optimised_data / "planned_early_late_contrasts.csv")
     specificity = pd.read_csv(optimised_data / "hierarchical_source_specificity.csv")
+    did = pd.read_csv(optimised_data / "matched_pseudo_difference_in_differences.csv")
+    fit_diagnostics = json.loads((optimised_data / "confirmatory_fit_diagnostics.json").read_text(encoding="utf-8"))
+    recovery_diagnostics = json.loads((optimised_data / "simulation_recovery_summary.json").read_text(encoding="utf-8"))
+    ppc = pd.read_csv(optimised_data / "posterior_predictive_checks.csv")
+    ppc_coverage = float(ppc.observed_in_predictive_interval.astype(str).str.lower().eq("true").mean())
     lagged = pd.read_csv(optimised_data / "lagged_autonomic_factor_tests.csv")
     loop = pd.read_csv(optimised_data / "dynamic_loop_model_comparison.csv")
     recovery = pd.read_csv(focused_data / "c_origin_js_recovery.csv")
@@ -481,6 +512,8 @@ def build(args) -> dict:
     consolidate = planned[(planned.analysis.eq("complete temporal coverage")) & planned.outcome.eq("kappa") & planned.contrast.str.startswith("FS(-1")].iloc[0]
     stable = planned[(planned.analysis.eq("complete temporal coverage")) & planned.outcome.eq("J")].iloc[0]
     c_specific = specificity[specificity.source_state.eq("C-specificity")].iloc[0]
+    onset_did = did[(did.source_state.eq("Global")) & did.outcome.eq("J") &
+                    did.contrast.eq("matched difference-in-differences")].iloc[0]
     best = loop[loop.outcome.eq("all")].sort_values("elpd", ascending=False).iloc[0]
     overall_recovery = recovery[recovery.contrast.str.startswith("Overall")].iloc[0]
     report = [
@@ -491,7 +524,8 @@ def build(args) -> dict:
         f"- Early FS baseline-oriented concentration was lower than ES: median contrast {early['median']:.4g} (95% CrI {early.ci95_low:.4g} to {early.ci95_high:.4g}); P(<0)={early.probability_lt_zero:.3f}.",
         f"- Complete-coverage events did not establish later FS consolidation: median late-minus-early κ {consolidate['median']:.4g} (95% CrI {consolidate.ci95_low:.4g} to {consolidate.ci95_high:.4g}); P(>0)={consolidate.probability_gt_zero:.3f}.",
         f"- FS divergence remained within the prespecified ±0.02 J equivalence region with probability {stable.probability_in_rope:.3f}.",
-        f"- C specificity was not established: P(βC > mean βother)={c_specific.probability_gt_zero:.3f}. The final-minute effect is distributed across sources.", "",
+        f"- Matched onset-specific J difference-in-differences: median {onset_did['median']:.4g} (95% CrI {onset_did.ci95_low:.4g} to {onset_did.ci95_high:.4g}); P(>0)={onset_did.probability_gt_zero:.3f}.",
+        f"- C specificity was not established: P(C-source J effect > mean other-source effects)={c_specific.probability_gt_zero:.3f}. The final-minute effect is distributed across sources.", "",
         "![Transition trajectories](figures/figure_03_transition_trajectories.png)", "",
         "![Planned contrasts](figures/figure_04_planned_contrasts.png)", "",
         "![Source and route](figures/figure_05_source_and_route.png)", "",
@@ -500,6 +534,13 @@ def build(args) -> dict:
         f"Postictal recovery remains a distinct secondary result: median log post/pre J {overall_recovery['median']:.3f} (95% CrI {overall_recovery.ci95_low:.3f} to {overall_recovery.ci95_high:.3f}); P(post<pre)={overall_recovery.probability_lt_zero:.3f}.", "",
         "![Autonomic factors](figures/figure_06_autonomic_factors.png)", "",
         "![Dynamic models](figures/figure_07_dynamic_models.png)", "",
+        "## Onset specificity and model validation", "",
+        "The primary onset-specific estimand is [FS genuine − FS matched pseudo] − [ES genuine − ES matched pseudo], with matching performed within participant and paired before aggregation.",
+        ("This contrast supports onset specificity beyond the FS-associated phenotype."
+         if onset_did.probability_gt_zero >= .975 or onset_did.probability_lt_zero >= .975 else
+         "This contrast does not establish onset specificity; the evidence supports an FS-associated transition phenotype, not an onset-specific biomarker."),
+        f"The destination-labelled symmetric masked-softmax model used {fit_diagnostics['chains']} NUTS chains × {fit_diagnostics['draws_per_chain']} retained draws. Divergences={fit_diagnostics['divergences']}; max R-hat={fit_diagnostics['max_r_hat']:.3f}; minimum bulk ESS={fit_diagnostics['min_ess_bulk']:.0f}. Posterior-predictive cell coverage={ppc_coverage:.3f}; simulation-recovery coefficient correlation={recovery_diagnostics['coefficient_correlation']:.3f}.", "",
+        "![Matched onset specificity and balance](figures/figure_08_pseudo_onset_balance.png)", "",
         "## Qualitative κ–J–CPI geometry", "",
         "The matched 3D views use identical axes for FS and ES. Points are event-by-time-bin means with small deterministic display jitter; colour is minutes before onset, and the black-diamond path joins time-bin medians. Log transforms preserve the strongly skewed positive J and κ axes; CPI tick labels remain in within-person z units. These plots are descriptive, not additional hypothesis tests.", "",
         "![FS 3D](figures/figure_09_fs_kappa_js_cpi_3d.png)", "",
@@ -507,8 +548,7 @@ def build(args) -> dict:
         "## Retained context and matching", "",
         "![Retained context](figures/figure_01_retained_context.png)", "",
         "![Autonomic and recovery](figures/figure_02_autonomic_and_recovery.png)", "",
-        "![Pseudo-onset balance](figures/figure_08_pseudo_onset_balance.png)", "",
-        "Primary transition outcomes are J, Kᴴ and D route. Baseline-oriented κ is secondary. Mean-field ADVI intervals are approximate; publication-critical borderline contrasts should be checked with NUTS. The pseudo-onset audit explicitly records unavailable movement/EMG, EOG, muscle power, bad-channel, sleep/wake, medication, respiration, CFA, segmentation and VR-overlap covariates.",
+        "Primary transition outcomes are J, Kᴴ and D route. Baseline-oriented κ is secondary. The pseudo-onset audit explicitly records unavailable movement/EMG, EOG, muscle power, bad-channel, sleep/wake, medication, respiration, CFA, segmentation and VR-overlap covariates.",
     ]
     (args.out_dir / "RESULTS.md").write_text("\n".join(report) + "\n", encoding="utf-8")
 
@@ -517,7 +557,10 @@ def build(args) -> dict:
         "completed_utc": datetime.now(timezone.utc).isoformat(),
         "strategy": "retain non-overlapping clinical context; replace legacy transition and flow analyses",
         "focused_source": str(args.focused_dir), "optimised_source": str(args.optimised_dir),
-        "equalised_transitions": 30, "primary_outcomes": ["J", "K_H", "D_route"],
+        "legacy_equalised_sensitivity_transitions": 30,
+        "primary_model_uses_raw_transition_totals": True,
+        "parameterisation": "destination-labelled symmetric sum-to-zero masked softmax",
+        "inference": "multi-chain NUTS", "primary_outcomes": ["J", "K_H", "D_route"],
         "secondary_outcome": "kappa", "figures_png": len(list(figures.glob("*.png"))),
         "figures_pdf": len(list(figures.glob("*.pdf"))), "three_d_display_jitter_seeded": True,
         "three_d_transforms": {"J": "log10", "kappa": "log10", "CPI_z": "asinh(CPI_z/2) with raw-unit ticks"},
@@ -533,6 +576,15 @@ def build(args) -> dict:
                "three_d_fs_event_bins": int(three_d.event_type.eq("functional").sum()),
                "three_d_es_event_bins": int(three_d.event_type.eq("epileptic").sum()),
                "c_specificity_probability": float(c_specific.probability_gt_zero),
+               "matched_j_did_median": float(onset_did["median"]),
+               "matched_j_did_ci95": [float(onset_did.ci95_low), float(onset_did.ci95_high)],
+               "matched_j_did_probability_gt_zero": float(onset_did.probability_gt_zero),
+               "nuts_chains": int(fit_diagnostics["chains"]),
+               "nuts_draws_per_chain": int(fit_diagnostics["draws_per_chain"]),
+               "nuts_divergences": int(fit_diagnostics["divergences"]),
+               "nuts_max_r_hat": float(fit_diagnostics["max_r_hat"]),
+               "ppc_cell_coverage": ppc_coverage,
+               "simulation_recovery_correlation": float(recovery_diagnostics["coefficient_correlation"]),
                "best_dynamic_model": str(best.model)}
     (args.out_dir / "SUMMARY.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
@@ -553,17 +605,44 @@ def self_check() -> None:
         assert all(high > low for low, high in limits)
 
 
+def build_with_overwrite(args) -> dict:
+    target = args.out_dir.resolve()
+    if not args.overwrite or not target.exists() or not any(target.iterdir()):
+        return build(args)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}-building-", dir=target.parent))
+    backup = target.with_name(f".{target.name}-previous")
+    if backup.exists():
+        shutil.rmtree(temporary)
+        raise FileExistsError(f"Refusing overwrite because backup path exists: {backup}")
+    temporary_args = argparse.Namespace(**vars(args)); temporary_args.out_dir = temporary
+    try:
+        summary = build(temporary_args)
+        target.rename(backup)
+        try:
+            temporary.rename(target)
+        except Exception:
+            backup.rename(target)
+            raise
+        shutil.rmtree(backup)
+        return summary
+    except Exception:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--focused-dir", type=Path)
     parser.add_argument("--optimised-dir", type=Path)
     parser.add_argument("--out-dir", type=Path)
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     if args.self_check: self_check(); print("publication build self-check passed"); return
     if args.focused_dir is None or args.optimised_dir is None or args.out_dir is None:
         parser.error("--focused-dir, --optimised-dir and --out-dir are required")
-    print(json.dumps(build(args), indent=2))
+    print(json.dumps(build_with_overwrite(args), indent=2))
 
 
 if __name__ == "__main__":

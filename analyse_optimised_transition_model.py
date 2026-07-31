@@ -29,6 +29,10 @@ EQUALISED_TRANSITIONS = 30
 JS_ROPE = 0.02
 AUTONOMIC_COLUMNS = ("mean_hr_bpm_z", "mean_rr_s_z", "csi_z", "cpi_z", "rmssd_s_z",
                       "rr_first_difference_s_z", "rr_acceleration_s_z", "rr_surprise_z")
+DESTINATION_INDEX = np.array([[destination for destination in range(len(STATES)) if destination != source]
+                              for source in range(len(STATES))], dtype=int)
+EDGE_LABELS = tuple(f"{STATES[source]}->{STATES[destination]}"
+                    for source in range(len(STATES)) for destination in DESTINATION_INDEX[source])
 
 
 def _configure_pymc_cache() -> None:
@@ -187,7 +191,7 @@ def prepare_model_windows(table: pd.DataFrame, common: pd.DataFrame) -> tuple[pd
     return frame, matches, covariates
 
 
-def reshape_counts(frame: pd.DataFrame, covariates: list[str]) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+def reshape_counts(frame: pd.DataFrame, covariates: list[str], aggregate: bool = False) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     rows, counts = [], []
     for source in range(len(STATES)):
         destinations = [index for index in range(len(STATES)) if index != source]
@@ -195,10 +199,20 @@ def reshape_counts(frame: pd.DataFrame, covariates: list[str]) -> tuple[pd.DataF
         values = frame[columns].to_numpy(int)
         keep = values.sum(axis=1) > 0
         part = frame.loc[keep, ["window_id", "participant", "event_key", *covariates]].copy()
+        if aggregate:
+            count_names = [f"count_{position}" for position in range(5)]
+            part[count_names] = values[keep]
+            grouping = ["participant", "event_key", *covariates]
+            part = part.groupby(grouping, observed=True, sort=False, as_index=False)[count_names].sum()
+            values_part = part[count_names].to_numpy(int)
+            part = part.drop(columns=count_names)
+            part["window_id"] = -1
+        else:
+            values_part = values[keep]
         part["source"] = source
-        part["total_transitions"] = values[keep].sum(axis=1)
+        part["total_transitions"] = values_part.sum(axis=1)
         rows.append(part)
-        counts.append(values[keep])
+        counts.append(values_part)
     long = pd.concat(rows, ignore_index=True)
     participants = pd.Index(frame.participant.unique(), name="participant")
     events = pd.Index(frame.event_key.unique(), name="event")
@@ -207,50 +221,102 @@ def reshape_counts(frame: pd.DataFrame, covariates: list[str]) -> tuple[pd.DataF
     return long, np.vstack(counts), frame[covariates].to_numpy(float)
 
 
-def fit_hierarchical_multinomial(frame: pd.DataFrame, covariates: list[str], out_dir: Path,
-                                 draws: int, advi_iterations: int, seed: int):
+def build_masked_softmax_model(long: pd.DataFrame, counts: np.ndarray, covariates: list[str],
+                               participant_labels, event_labels):
     _configure_pymc_cache()
-    import arviz as az
     import pymc as pm
     import pytensor.tensor as pt
 
-    long, counts, _ = reshape_counts(frame, covariates)
     x = long[covariates].to_numpy(float)
     source = long.source.to_numpy(int)
     participant = long.participant_index.to_numpy(int)
     event = long.event_index.to_numpy(int)
     totals = counts.sum(axis=1).astype(int)
-    coords = {"source": STATES, "covariate": covariates, "alr": np.arange(4),
-              "participant": frame.participant.unique(), "event": frame.event_key.unique(),
+    destinations = DESTINATION_INDEX[source]
+    edge_destination = DESTINATION_INDEX.reshape(-1)
+    coords = {"source": STATES, "destination": STATES, "edge": EDGE_LABELS,
+              "covariate": covariates, "participant": participant_labels, "event": event_labels,
               "observation": np.arange(len(long)), "destination_position": np.arange(5)}
     with pm.Model(coords=coords) as model:
-        beta_mean = pm.Normal("beta_mean", 0, 1, dims=("covariate", "alr"))
-        beta_sd = pm.HalfNormal("beta_sd", .5, dims=("covariate", "alr"))
-        beta_offset = pm.Normal("beta_offset", 0, 1, dims=("source", "covariate", "alr"))
-        beta = pm.Deterministic("beta", beta_mean[None, :, :] + beta_sd[None, :, :] * beta_offset,
-                                dims=("source", "covariate", "alr"))
-        participant_sd = pm.HalfNormal("participant_sd", .5, dims=("source", "alr"))
-        participant_offset = pm.Normal("participant_offset", 0, 1,
-                                       dims=("participant", "source", "alr"))
-        event_sd = pm.HalfNormal("event_sd", .35, dims=("source", "alr"))
-        event_offset = pm.Normal("event_offset", 0, 1, dims=("event", "source", "alr"))
-        eta = (pt.sum(beta[source] * x[:, :, None], axis=1) +
-               participant_offset[participant, source] * participant_sd[source] +
-               event_offset[event, source] * event_sd[source])
-        probability = pm.math.softmax(pt.concatenate((eta, pt.zeros((len(long), 1))), axis=1), axis=1)
+        beta_mean = pm.Normal("beta_mean", 0, 1, dims=("covariate", "destination"))
+        beta_sd = pm.HalfNormal("beta_sd", .5, dims=("covariate", "destination"))
+        beta_offset = pm.Normal("beta_offset", 0, 1, dims=("edge", "covariate"))
+        raw_edge = (beta_mean[:, edge_destination].dimshuffle(1, 0) +
+                    beta_sd[:, edge_destination].dimshuffle(1, 0) * beta_offset)
+        by_source = raw_edge.reshape((len(STATES), 5, len(covariates)))
+        beta_edge = pm.Deterministic("beta_edge",
+                                     (by_source - pt.mean(by_source, axis=1, keepdims=True)).reshape((-1, len(covariates))),
+                                     dims=("edge", "covariate"))
+        fixed = pt.sum(beta_edge.reshape((len(STATES), 5, len(covariates)))[source] * x[:, None, :], axis=2)
+
+        participant_sd = pm.HalfNormal("participant_sd", .5, dims=("source", "destination"))
+        participant_offset = pm.Normal("participant_offset", 0, 1, dims=("participant", "destination"))
+        participant_full = participant_offset[participant] * participant_sd[source]
+        participant_allowed = participant_full[pt.arange(len(long))[:, None], destinations]
+        participant_allowed -= pt.mean(participant_allowed, axis=1, keepdims=True)
+
+        event_sd = pm.HalfNormal("event_sd", .35, dims=("source", "destination"))
+        event_offset = pm.Normal("event_offset", 0, 1, dims=("event", "destination"))
+        event_full = event_offset[event] * event_sd[source]
+        event_allowed = event_full[pt.arange(len(long))[:, None], destinations]
+        event_allowed -= pt.mean(event_allowed, axis=1, keepdims=True)
+
+        probability = pm.math.softmax(fixed + participant_allowed + event_allowed, axis=1)
         pm.Multinomial("transition_counts", n=totals, p=probability, observed=counts,
                        dims=("observation", "destination_position"))
-        approximation = pm.fit(advi_iterations, method="advi", random_seed=seed, progressbar=True,
-                               callbacks=[pm.callbacks.CheckParametersConvergence(tolerance=1e-4)])
-        posterior = approximation.sample(draws, random_seed=seed, return_inferencedata=True)
+    return model
+
+
+def fit_hierarchical_multinomial(frame: pd.DataFrame, covariates: list[str], out_dir: Path,
+                                 draws: int, tune: int, chains: int, cores: int,
+                                 target_accept: float, seed: int):
+    _configure_pymc_cache()
+    import arviz as az
+    import pymc as pm
+
+    long, counts, _ = reshape_counts(frame, covariates, aggregate=True)
+    participants = frame.participant.unique()
+    events = frame.event_key.unique()
+    model = build_masked_softmax_model(long, counts, covariates, participants, events)
+    with model:
+        posterior = pm.sample(draws=draws, tune=tune, chains=chains, cores=min(cores, chains),
+                              target_accept=target_accept, random_seed=seed, progressbar=True,
+                              compute_convergence_checks=False,
+                              idata_kwargs={"log_likelihood": False}, return_inferencedata=True)
     posterior.posterior.attrs.update({"likelihood": "Multinomial raw transition counts",
-                                      "inference": "mean-field ADVI", "advi_iterations": advi_iterations,
+                                      "parameterisation": "destination-labelled symmetric sum-to-zero masked softmax",
+                                      "inference": "multi-chain NUTS", "tune": tune,
+                                      "chains": chains, "target_accept": target_accept,
                                       "transition_count_role": "multinomial denominator only"})
     az.to_netcdf(posterior, out_dir / "hierarchical_multinomial_posterior.nc")
-    pd.DataFrame({"iteration": np.arange(1, len(approximation.hist) + 1),
-                  "negative_elbo": approximation.hist}).to_csv(out_dir / "advi_loss.csv", index=False)
     long.to_csv(out_dir / "hierarchical_multinomial_observations.csv", index=False)
-    return posterior, long
+    pd.DataFrame({"edge": EDGE_LABELS,
+                  "source_state": np.repeat(STATES, 5),
+                  "destination": np.array(STATES)[DESTINATION_INDEX.reshape(-1)]}) \
+        .to_csv(out_dir / "hierarchical_edge_map.csv", index=False)
+
+    diagnostics = az.summary(posterior, var_names=["beta_edge", "beta_mean", "beta_sd",
+                                                    "participant_offset", "participant_sd",
+                                                    "event_offset", "event_sd"], kind="diagnostics")
+    diagnostics.rename_axis("parameter").reset_index().to_csv(out_dir / "nuts_diagnostics.csv", index=False)
+    sample_stats = posterior.sample_stats
+    confirmatory = diagnostics[~diagnostics.index.str.startswith(("participant_offset", "event_offset"))]
+    fit_diagnostics = {"chains": chains, "draws_per_chain": draws, "tune_per_chain": tune,
+                       "target_accept": target_accept,
+                       "divergences": int(sample_stats["diverging"].sum()),
+                       "max_r_hat": float(confirmatory.r_hat.max()),
+                       "min_ess_bulk": float(confirmatory.ess_bulk.min()),
+                       "min_ess_tail": float(confirmatory.ess_tail.min()),
+                       "all_parameter_max_r_hat": float(diagnostics.r_hat.max()),
+                       "all_parameter_min_ess_bulk": float(diagnostics.ess_bulk.min())}
+    if "tree_depth" in sample_stats:
+        fit_diagnostics["max_tree_depth"] = int(sample_stats["tree_depth"].max())
+    fit_diagnostics["confirmatory_thresholds_met"] = bool(
+        fit_diagnostics["divergences"] == 0 and fit_diagnostics["max_r_hat"] <= 1.01 and
+        fit_diagnostics["min_ess_bulk"] >= 400)
+    (out_dir / "confirmatory_fit_diagnostics.json").write_text(
+        json.dumps(fit_diagnostics, indent=2), encoding="utf-8")
+    return posterior, long, counts, fit_diagnostics
 
 
 def posterior_array(posterior, name: str) -> np.ndarray:
@@ -314,15 +380,64 @@ def equal_event_participant_mean(values: np.ndarray, meta: pd.DataFrame, keep: n
     return np.mean(participant_draws, axis=0)
 
 
+def matched_pseudo_estimands(values: np.ndarray, meta: pd.DataFrame, source_state: str,
+                             outcome: str) -> list[dict]:
+    columns = np.arange(len(meta))
+    genuine = meta.loc[meta.true_onset.eq(1) & meta.window_end_to_ictus_s.eq(0),
+                       ["participant", "event_key", "is_functional"]].copy()
+    genuine["genuine_column"] = columns[meta.true_onset.eq(1) & meta.window_end_to_ictus_s.eq(0)]
+    pseudo = meta.loc[meta.true_onset.eq(0), ["participant", "event_key", "is_functional"]].copy()
+    pseudo["pseudo_column"] = columns[meta.true_onset.eq(0)]
+    pairs = genuine.merge(pseudo, on=["participant", "event_key", "is_functional"], how="inner",
+                           validate="one_to_one")
+    if pairs.empty:
+        return []
+
+    def participant_mean(part: pd.DataFrame, left: str, right: str | None = None) -> np.ndarray:
+        participant_draws = []
+        for _, cells in part.groupby("participant", observed=True, sort=False):
+            draw = values[:, cells[left].to_numpy(int)]
+            if right is not None:
+                draw = draw - values[:, cells[right].to_numpy(int)]
+            participant_draws.append(draw.mean(axis=1))
+        return np.mean(participant_draws, axis=0)
+
+    group_draws = {}
+    rows = []
+    for group, functional in (("ES", 0), ("FS", 1)):
+        part = pairs[pairs.is_functional.eq(functional)]
+        if part.empty:
+            continue
+        genuine_draw = participant_mean(part, "genuine_column")
+        pseudo_draw = participant_mean(part, "pseudo_column")
+        change = participant_mean(part, "genuine_column", "pseudo_column")
+        group_draws[group] = {"genuine": genuine_draw, "pseudo": pseudo_draw, "change": change}
+        row = summarise(change, source_state=source_state, outcome=outcome,
+                        contrast=f"{group} genuine minus matched pseudo")
+        row.update({"n_pairs": len(part), "n_participants": part.participant.nunique(), "matched": True})
+        rows.append(row)
+    if set(group_draws) == {"ES", "FS"}:
+        contrasts = {
+            "FS minus ES at genuine onset": group_draws["FS"]["genuine"] - group_draws["ES"]["genuine"],
+            "FS minus ES at matched pseudo-onset": group_draws["FS"]["pseudo"] - group_draws["ES"]["pseudo"],
+            "matched difference-in-differences": group_draws["FS"]["change"] - group_draws["ES"]["change"],
+        }
+        for label, draw in contrasts.items():
+            row = summarise(draw, source_state=source_state, outcome=outcome, contrast=label)
+            row.update({"n_pairs": len(pairs), "n_participants": pairs.participant.nunique(), "matched": True})
+            rows.append(row)
+    return rows
+
+
 def derive_posterior_metrics(posterior, long: pd.DataFrame, frame: pd.DataFrame,
                              covariates: list[str], baseline_table: pd.DataFrame,
-                             out_dir: Path, seed: int) -> tuple[pd.DataFrame, dict, dict]:
-    beta = posterior_array(posterior, "beta")
-    participant_effect = (posterior_array(posterior, "participant_offset") *
-                          posterior_array(posterior, "participant_sd")[:, None, :, :])
-    event_effect = (posterior_array(posterior, "event_offset") *
-                    posterior_array(posterior, "event_sd")[:, None, :, :])
-    n_draws = beta.shape[0]
+                             out_dir: Path, seed: int) -> tuple[pd.DataFrame, dict, dict, pd.DataFrame]:
+    beta_edge = posterior_array(posterior, "beta_edge")
+    participant_offset = posterior_array(posterior, "participant_offset")
+    participant_sd = posterior_array(posterior, "participant_sd")
+    event_offset = posterior_array(posterior, "event_offset")
+    event_sd = posterior_array(posterior, "event_sd")
+    n_draws = beta_edge.shape[0]
     rng = np.random.default_rng(seed)
     baseline_counts = {}
     for source in range(len(STATES)):
@@ -334,15 +449,22 @@ def derive_posterior_metrics(posterior, long: pd.DataFrame, frame: pd.DataFrame,
     metric_names = ("J", "K_H", "D_route", "kappa")
     global_sum = {name: np.zeros((n_draws, len(frame))) for name in metric_names}
     global_n = np.zeros(len(frame), int)
-    rows, destination_rows, cells = [], [], {}
+    rows, destination_rows, did_rows, cells = [], [], [], {}
     for source in range(len(STATES)):
         use = long.source.eq(source).to_numpy()
         meta = long.loc[use].reset_index(drop=True)
         x = meta[covariates].to_numpy(float)
-        eta = (np.einsum("sck,oc->sok", beta[:, source], x) +
-               participant_effect[:, meta.participant_index.to_numpy(int), source] +
-               event_effect[:, meta.event_index.to_numpy(int), source])
-        probability = softmax_last_reference(eta)
+        beta = beta_edge[:, source * 5:(source + 1) * 5, :]
+        participant_full = (participant_offset[:, meta.participant_index.to_numpy(int), :] *
+                            participant_sd[:, None, source, :])
+        participant_allowed = participant_full[:, :, DESTINATION_INDEX[source]]
+        participant_allowed -= participant_allowed.mean(axis=2, keepdims=True)
+        event_full = (event_offset[:, meta.event_index.to_numpy(int), :] *
+                      event_sd[:, None, source, :])
+        event_allowed = event_full[:, :, DESTINATION_INDEX[source]]
+        event_allowed -= event_allowed.mean(axis=2, keepdims=True)
+        eta = np.einsum("skc,oc->sok", beta, x) + participant_allowed + event_allowed
+        probability = softmax_last_reference(eta[..., :-1] - eta[..., -1, None])
         baseline_by_participant = {}
         for participant in meta.participant.astype(str).unique():
             count = baseline_counts[source].get(participant)
@@ -376,6 +498,8 @@ def derive_posterior_metrics(posterior, long: pd.DataFrame, frame: pd.DataFrame,
                                                       group="FS minus ES",
                                                       outcome="destination_probability_change"))
         window_meta = frame.set_index("window_id").loc[window_ids].reset_index()
+        for name in metric_names:
+            did_rows.extend(matched_pseudo_estimands(metrics[name], window_meta, STATES[source], name))
         for observation, item in window_meta.iterrows():
             row = {key: item[key] for key in ("window_id", "participant", "event_key", "file_path", "condition",
                                                "time_bin", "window_start_s", "window_end_s",
@@ -408,8 +532,167 @@ def derive_posterior_metrics(posterior, long: pd.DataFrame, frame: pd.DataFrame,
                           "is_functional", "is_dd"]].copy()
     for name in metric_names:
         global_means[name] = global_metrics[name].mean(axis=0)
+        did_rows.extend(matched_pseudo_estimands(global_metrics[name], frame.reset_index(drop=True), "Global", name))
     global_means.to_csv(out_dir / "posterior_global_transition_window_means.csv.gz", index=False, compression="gzip")
-    return global_means, global_metrics, cells
+    did = pd.DataFrame(did_rows)
+    did.to_csv(out_dir / "matched_pseudo_difference_in_differences.csv", index=False)
+    return global_means, global_metrics, cells, did
+
+
+def posterior_predictive_checks(posterior, long: pd.DataFrame, counts: np.ndarray,
+                                frame: pd.DataFrame, covariates: list[str], out_dir: Path,
+                                seed: int, max_draws: int = 200) -> dict:
+    beta_edge = posterior_array(posterior, "beta_edge")
+    participant_offset = posterior_array(posterior, "participant_offset")
+    participant_sd = posterior_array(posterior, "participant_sd")
+    event_offset = posterior_array(posterior, "event_offset")
+    event_sd = posterior_array(posterior, "event_sd")
+    selected = np.linspace(0, len(beta_edge) - 1, min(max_draws, len(beta_edge)), dtype=int)
+    beta_edge, participant_offset, participant_sd, event_offset, event_sd = (
+        value[selected] for value in (beta_edge, participant_offset, participant_sd,
+                                      event_offset, event_sd))
+    rng = np.random.default_rng(seed)
+    predictive_rows, discrepancy_rows = [], []
+    covered = []
+    for source in range(len(STATES)):
+        use = long.source.eq(source).to_numpy()
+        meta = long.loc[use].reset_index(drop=True)
+        window_meta = frame.set_index("window_id").loc[meta.window_id].reset_index()
+        observed = counts[use]
+        totals = observed.sum(axis=1).astype(int)
+        x = meta[covariates].to_numpy(float)
+        beta = beta_edge[:, source * 5:(source + 1) * 5, :]
+        participant_full = (participant_offset[:, meta.participant_index.to_numpy(int), :] *
+                            participant_sd[:, None, source, :])
+        participant_allowed = participant_full[:, :, DESTINATION_INDEX[source]]
+        participant_allowed -= participant_allowed.mean(axis=2, keepdims=True)
+        event_full = event_offset[:, meta.event_index.to_numpy(int), :] * event_sd[:, None, source, :]
+        event_allowed = event_full[:, :, DESTINATION_INDEX[source]]
+        event_allowed -= event_allowed.mean(axis=2, keepdims=True)
+        eta = np.einsum("skc,oc->sok", beta, x) + participant_allowed + event_allowed
+        eta -= eta.max(axis=2, keepdims=True)
+        probability = np.exp(eta); probability /= probability.sum(axis=2, keepdims=True)
+
+        observed_discrepancy, replicated_discrepancy = [], []
+        cell_masks = {}
+        for group, functional in (("ES", 0), ("FS", 1)):
+            for window_type, mask in (
+                    ("matched pseudo-onset", window_meta.true_onset.eq(0).to_numpy()),
+                    ("early genuine", window_meta.time_bin.eq(TIME_BINS[0][2]).to_numpy()),
+                    ("final-minute genuine", window_meta.time_bin.eq(TIME_BINS[-1][2]).to_numpy())):
+                keep = mask & window_meta.is_functional.eq(functional).to_numpy()
+                if keep.any():
+                    cell_masks[(group, window_type)] = keep
+        cell_draws = {key: [] for key in cell_masks}
+        for draw in range(len(selected)):
+            expected = totals[:, None] * probability[draw]
+            replicated = rng.multinomial(totals, probability[draw])
+            observed_discrepancy.append(float(np.sum((observed - expected) ** 2 / (expected + .5))))
+            replicated_discrepancy.append(float(np.sum((replicated - expected) ** 2 / (expected + .5))))
+            for key, keep in cell_masks.items():
+                aggregate = replicated[keep].sum(axis=0)
+                cell_draws[key].append(aggregate / aggregate.sum())
+        observed_discrepancy = np.asarray(observed_discrepancy)
+        replicated_discrepancy = np.asarray(replicated_discrepancy)
+        discrepancy_rows.append({"source_state": STATES[source], "draws": len(selected),
+                                 "bayesian_p_value": float(np.mean(replicated_discrepancy >= observed_discrepancy)),
+                                 "observed_discrepancy_mean": float(observed_discrepancy.mean()),
+                                 "replicated_discrepancy_mean": float(replicated_discrepancy.mean())})
+        for (group, window_type), draws in cell_draws.items():
+            keep = cell_masks[(group, window_type)]
+            observed_proportion = observed[keep].sum(axis=0) / observed[keep].sum()
+            draws = np.asarray(draws)
+            low, median, high = np.quantile(draws, (.025, .5, .975), axis=0)
+            for position, destination in enumerate(DESTINATION_INDEX[source]):
+                in_interval = bool(low[position] <= observed_proportion[position] <= high[position])
+                covered.append(in_interval)
+                predictive_rows.append({"source_state": STATES[source], "destination": STATES[destination],
+                                        "group": group, "window_type": window_type,
+                                        "observed_proportion": float(observed_proportion[position]),
+                                        "predictive_median": float(median[position]),
+                                        "predictive_ci95_low": float(low[position]),
+                                        "predictive_ci95_high": float(high[position]),
+                                        "observed_in_predictive_interval": in_interval,
+                                        "ppc_draws": len(selected)})
+    pd.DataFrame(predictive_rows).to_csv(out_dir / "posterior_predictive_checks.csv", index=False)
+    pd.DataFrame(discrepancy_rows).to_csv(out_dir / "posterior_predictive_discrepancy.csv", index=False)
+    summary = {"ppc_draws": len(selected), "cell_interval_coverage": float(np.mean(covered)),
+               "min_source_bayesian_p_value": float(pd.DataFrame(discrepancy_rows).bayesian_p_value.min()),
+               "max_source_bayesian_p_value": float(pd.DataFrame(discrepancy_rows).bayesian_p_value.max())}
+    return summary
+
+
+def simulation_recovery(out_dir: Path, draws: int, tune: int, chains: int, seed: int) -> dict:
+    _configure_pymc_cache()
+    import arviz as az
+    import pymc as pm
+
+    rng = np.random.default_rng(seed)
+    covariates = ["intercept", "group_fs", "true_onset", "group_x_true"]
+    participants = np.array([f"sim_p{index:02d}" for index in range(12)])
+    events = np.array([f"sim_e{index:02d}" for index in range(24)])
+    windows = []
+    for event_index, event in enumerate(events):
+        participant_index = event_index % len(participants)
+        group = float(event_index % 2)
+        for genuine in (0.0, 1.0):
+            windows.append({"participant": participants[participant_index], "event_key": event,
+                            "participant_index": participant_index, "event_index": event_index,
+                            "intercept": 1.0, "group_fs": group, "true_onset": genuine,
+                            "group_x_true": group * genuine})
+    windows = pd.DataFrame(windows)
+    true_beta = np.zeros((len(STATES), 5, len(covariates)))
+    destination_signal = np.array([-.45, -.25, -.05, .15, .35, .55])
+    for source in range(len(STATES)):
+        true_beta[source, :, 0] = np.linspace(-.35, .35, 5)
+        signal = destination_signal[DESTINATION_INDEX[source]]
+        true_beta[source, :, 3] = signal - signal.mean()
+    participant_effect = rng.normal(0, .12, (len(participants), len(STATES)))
+    event_effect = rng.normal(0, .08, (len(events), len(STATES)))
+    rows, counts = [], []
+    for source in range(len(STATES)):
+        x = windows[covariates].to_numpy(float)
+        eta = np.einsum("kc,oc->ok", true_beta[source], x)
+        p_effect = participant_effect[windows.participant_index.to_numpy(int)][:, DESTINATION_INDEX[source]]
+        e_effect = event_effect[windows.event_index.to_numpy(int)][:, DESTINATION_INDEX[source]]
+        eta += p_effect - p_effect.mean(axis=1, keepdims=True)
+        eta += e_effect - e_effect.mean(axis=1, keepdims=True)
+        eta -= eta.max(axis=1, keepdims=True)
+        probability = np.exp(eta); probability /= probability.sum(axis=1, keepdims=True)
+        part = windows.copy(); part["source"] = source; part["window_id"] = np.arange(len(windows))
+        part["total_transitions"] = 30; rows.append(part)
+        counts.append(rng.multinomial(30, probability))
+    long = pd.concat(rows, ignore_index=True)
+    counts = np.vstack(counts)
+    model = build_masked_softmax_model(long, counts, covariates, participants, events)
+    with model:
+        posterior = pm.sample(draws=draws, tune=tune, chains=chains, cores=1, target_accept=.9,
+                              random_seed=seed + 1, progressbar=True, compute_convergence_checks=False,
+                              idata_kwargs={"log_likelihood": False}, return_inferencedata=True)
+    recovered = posterior_array(posterior, "beta_edge").reshape((-1, len(STATES), 5, len(covariates)))[:, :, :, 3]
+    low, median, high = np.quantile(recovered, (.025, .5, .975), axis=0)
+    rows = []
+    for source in range(len(STATES)):
+        for position, destination in enumerate(DESTINATION_INDEX[source]):
+            truth = true_beta[source, position, 3]
+            rows.append({"source_state": STATES[source], "destination": STATES[destination],
+                         "covariate": "group_x_true", "truth": truth,
+                         "posterior_median": median[source, position],
+                         "ci95_low": low[source, position], "ci95_high": high[source, position],
+                         "covered": bool(low[source, position] <= truth <= high[source, position])})
+    result = pd.DataFrame(rows)
+    result.to_csv(out_dir / "simulation_recovery.csv", index=False)
+    diagnostic = az.summary(posterior, var_names=["beta_edge"], kind="diagnostics")
+    summary = {"simulation_chains": chains, "simulation_draws_per_chain": draws,
+               "simulation_tune_per_chain": tune,
+               "coefficient_correlation": float(np.corrcoef(result.truth, result.posterior_median)[0, 1]),
+               "coefficient_rmse": float(np.sqrt(np.mean((result.truth - result.posterior_median) ** 2))),
+               "interval_coverage": float(result.covered.mean()),
+               "max_r_hat": float(diagnostic.r_hat.max()),
+               "min_ess_bulk": float(diagnostic.ess_bulk.min()),
+               "divergences": int(posterior.sample_stats["diverging"].sum())}
+    (out_dir / "simulation_recovery_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
 
 
 def planned_contrasts(frame: pd.DataFrame, global_metrics: dict[str, np.ndarray], cells: dict,
@@ -483,11 +766,11 @@ def source_specificity(cells: dict, out_dir: Path) -> pd.DataFrame:
     late = TIME_BINS[-1][2]
     effects = {state: cells[("J", state, "FS", late, False)] - cells[("J", state, "ES", late, False)]
                for state in STATES}
-    rows = [summarise(draw, source_state=state, outcome="J", estimand="FS minus ES in final minute")
+    rows = [summarise(draw, source_state=state, outcome="J", estimand="final-minute FS minus ES in J")
             for state, draw in effects.items()]
     difference = effects["C"] - np.mean([effects[state] for state in STATES if state != "C"], axis=0)
     rows.append(summarise(difference, source_state="C-specificity", outcome="J",
-                          estimand="beta_C minus mean beta_other"))
+                          estimand="C-source J effect minus mean other-source J effect"))
     result = pd.DataFrame(rows)
     result.to_csv(out_dir / "hierarchical_source_specificity.csv", index=False)
     return result
@@ -697,7 +980,8 @@ def matching_balance(matches: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
 
 
 def write_report(out_dir: Path, planned: pd.DataFrame, specificity: pd.DataFrame,
-                 factor_tests: pd.DataFrame, loop: pd.DataFrame, audit: dict) -> None:
+                 did: pd.DataFrame, factor_tests: pd.DataFrame, loop: pd.DataFrame,
+                 audit: dict, fit_diagnostics: dict, ppc: dict, recovery: dict) -> None:
     def markdown(frame: pd.DataFrame, columns: list[str]) -> str:
         use = frame[[column for column in columns if column in frame]].copy()
         for column in use.select_dtypes(include="number"):
@@ -709,12 +993,25 @@ def write_report(out_dir: Path, planned: pd.DataFrame, specificity: pd.DataFrame
 
     best = loop[loop.outcome.eq("all")].sort_values("elpd", ascending=False).iloc[0]
     c_specific = specificity[specificity.source_state.eq("C-specificity")].iloc[0]
+    headline_did = did[(did.source_state.eq("Global")) & did.outcome.eq("J") &
+                       did.contrast.eq("matched difference-in-differences")].iloc[0]
     balance = pd.read_csv(out_dir / "pseudo_onset_match_balance.csv").set_index("matching_variable")
     position_difference = balance.loc["record_fraction", "median_absolute_paired_difference"]
     report = ["# Equalised and optimised transition analysis", "",
               f"Completed: {datetime.now(timezone.utc).isoformat()}", "",
               "## Model", "",
-              "Raw transition counts were fitted with one hierarchical multinomial ALR model. Transition totals enter only as each Multinomial denominator. Source-specific coefficients share population priors; participant and event random effects are included. Mean-field ADVI supplies posterior draws, so intervals are approximate and should be checked with NUTS if a publication-critical contrast is borderline.", "",
+              "Raw transition counts were fitted with a destination-labelled hierarchical multinomial masked-softmax model. For every source, the five allowed destination logits are constrained to sum to zero; the self-transition is structurally excluded. Population shrinkage is indexed by destination label rather than by a source-dependent coordinate position. Participant and event random destination effects are included, and transition totals enter only as each Multinomial denominator.", "",
+              f"The confirmatory fit used {fit_diagnostics['chains']} NUTS chains with {fit_diagnostics['draws_per_chain']} retained draws per chain after {fit_diagnostics['tune_per_chain']} tuning iterations. Divergences={fit_diagnostics['divergences']}; max R-hat={fit_diagnostics['max_r_hat']:.3f}; minimum bulk ESS={fit_diagnostics['min_ess_bulk']:.0f}.", "",
+              "## Matched pseudo-onset difference-in-differences", "",
+              "The onset-specific estimand is [FS genuine - FS matched pseudo] - [ES genuine - ES matched pseudo]. Genuine and pseudo windows are paired within the same participant and event match before participant-equal aggregation.", "",
+              markdown(did[(did.outcome.eq("J")) &
+                           ((did.source_state.eq("Global")) |
+                            did.contrast.eq("matched difference-in-differences"))],
+                       ["source_state", "contrast", "median", "ci95_low", "ci95_high",
+                        "probability_lt_zero", "probability_gt_zero", "n_pairs", "n_participants"]), "",
+              f"Global J difference-in-differences: median {headline_did['median']:.4g} "
+              f"(95% CrI {headline_did.ci95_low:.4g} to {headline_did.ci95_high:.4g}); "
+              f"P(>0)={headline_did.probability_gt_zero:.3f}.", "",
               "## Planned early-destabilisation / late-consolidation contrasts", "",
               markdown(planned, ["analysis", "outcome", "contrast", "median", "ci95_low", "ci95_high",
                                  "probability_lt_zero", "probability_gt_zero", "probability_in_rope"]), "",
@@ -722,7 +1019,10 @@ def write_report(out_dir: Path, planned: pd.DataFrame, specificity: pd.DataFrame
               "## C specificity", "",
               markdown(specificity, ["source_state", "estimand", "median", "ci95_low", "ci95_high",
                                      "probability_gt_zero"]), "",
-              f"P(beta_C > mean beta_other) = {c_specific.probability_gt_zero:.3f}. C remains the pre-specified source; specificity is not claimed unless this posterior probability is compelling.", "",
+              f"P(C-source J effect > mean other-source J effect) = {c_specific.probability_gt_zero:.3f}. C remains the pre-specified source; specificity is not claimed unless this posterior probability is compelling.", "",
+              "## Model validation", "",
+              f"Posterior predictive 95% interval coverage across source-destination/group/window cells was {ppc['cell_interval_coverage']:.3f}; source-level Bayesian discrepancy p-values ranged from {ppc['min_source_bayesian_p_value']:.3f} to {ppc['max_source_bayesian_p_value']:.3f}.",
+              f"Simulation recovery for the destination-labelled genuine-onset interaction gave coefficient correlation {recovery['coefficient_correlation']:.3f}, RMSE {recovery['coefficient_rmse']:.3f}, and 95% interval coverage {recovery['interval_coverage']:.3f}.", "",
               "## Latent autonomic factors", "",
               "Three orthogonal PCs were defined only from interictal windows and labelled by prespecified cardiac anchors. Lagged tests use within-event fixed effects and participant-clustered standard errors.", "",
               markdown(factor_tests, ["analysis", "estimate", "ci95_low", "ci95_high", "p_value", "n_events"]), "",
@@ -746,6 +1046,11 @@ def write_report(out_dir: Path, planned: pd.DataFrame, specificity: pd.DataFrame
         report.append("Early lower concentration and stable early-to-final JS are supported, but later consolidation is not established; the full clinical claim should not be made.")
     else:
         report.append("The full early-destabilisation/later-consolidation hypothesis is not supported.")
+    report.extend(["", "## Onset-specific interpretation", ""])
+    if headline_did.probability_gt_zero >= .975 or headline_did.probability_lt_zero >= .975:
+        report.append("The matched difference-in-differences supports an onset-specific transition effect beyond the broader FS-associated phenotype.")
+    else:
+        report.append("The matched difference-in-differences does not establish onset specificity. The result supports an FS-associated transition phenotype, not an onset-specific biomarker.")
     (out_dir.parent / "RESULTS.md").write_text("\n".join(report) + "\n", encoding="utf-8")
 
 
@@ -754,8 +1059,6 @@ def run(args) -> dict:
     data_dir.mkdir(parents=True, exist_ok=True)
     table = enrich_table(pd.read_csv(args.peak_windows_csv))
     reference_qc = pd.read_csv(args.reference_qc_csv)
-    legacy.FIXED_EXITS = EQUALISED_TRANSITIONS
-    legacy.raw_count_primary(table, reference_qc, data_dir, args.draws, args.seed + 1)
     valid_participants = legacy.reference_participants(reference_qc, .50)
     valid_participants &= set(table.loc[table.condition.eq("ii"), "participant"].astype(str))
     table = table[table.participant.astype(str).isin(valid_participants)].copy()
@@ -772,38 +1075,55 @@ def run(args) -> dict:
         _configure_pymc_cache()
         import arviz as az
         posterior = az.from_netcdf(data_dir / "hierarchical_multinomial_posterior.nc")
+        if "destination-labelled" not in posterior.posterior.attrs.get("parameterisation", ""):
+            raise ValueError("The saved posterior uses the obsolete source-position ALR parameterisation")
         long = pd.read_csv(data_dir / "hierarchical_multinomial_observations.csv")
+        fit_diagnostics = json.loads((data_dir / "confirmatory_fit_diagnostics.json").read_text(encoding="utf-8"))
     else:
-        posterior, long = fit_hierarchical_multinomial(frame, covariates, data_dir, args.draws,
-                                                       args.advi_iterations, args.seed)
-    global_means, global_metrics, cells = derive_posterior_metrics(
-        posterior, long, frame, covariates, table, data_dir, args.seed + 2)
+        posterior, long, counts, fit_diagnostics = fit_hierarchical_multinomial(
+            frame, covariates, data_dir, args.draws, args.tune, args.chains, args.cores,
+            args.target_accept, args.seed)
+    prediction_long, prediction_counts, _ = reshape_counts(frame, covariates)
+    global_means, global_metrics, cells, did = derive_posterior_metrics(
+        posterior, prediction_long, frame, covariates, table, data_dir, args.seed + 2)
+    ppc = posterior_predictive_checks(posterior, prediction_long, prediction_counts, frame, covariates, data_dir,
+                                      args.seed + 3, args.ppc_draws)
+    recovery = simulation_recovery(data_dir, args.recovery_draws, args.recovery_tune,
+                                   args.recovery_chains, args.seed + 4)
     planned = planned_contrasts(frame, global_metrics, cells, data_dir)
-    spline_trajectory(frame, global_metrics, data_dir, args.seed + 3)
+    spline_trajectory(frame, global_metrics, data_dir, args.seed + 5)
     specificity = source_specificity(cells, data_dir)
     factors = autonomic_factors(common, data_dir)
     dynamic = make_dynamic_frame(factors, global_means)
     dynamic.to_csv(data_dir / "joint_dynamic_windows.csv.gz", index=False, compression="gzip")
     factor_tests = lagged_factor_tests(dynamic, data_dir)
     loop, _ = dynamic_loop_comparison(dynamic, data_dir)
-    write_report(data_dir, planned, specificity, factor_tests, loop, availability)
+    write_report(data_dir, planned, specificity, did, factor_tests, loop, availability,
+                 fit_diagnostics, ppc, recovery)
 
     summary = {"model_windows": len(frame), "multinomial_rows": len(long),
                "participants": int(frame.participant.nunique()), "events": int(frame.event_key.nunique()),
                "pseudo_onset_matches": len(matches),
-               "posterior_draws": args.draws, "advi_iterations": args.advi_iterations,
-               "equalised_transitions": EQUALISED_TRANSITIONS,
+               "posterior_draws_total": args.draws * args.chains, "chains": args.chains,
+               "draws_per_chain": args.draws, "tune_per_chain": args.tune,
+               "legacy_equalised_sensitivity_transitions": EQUALISED_TRANSITIONS,
+               "legacy_equalised_sensitivity_run": False,
                "complete_coverage_events": int(planned.complete_events.iloc[0]),
                "p_c_specific_gt_mean_other": float(specificity.loc[
                    specificity.source_state.eq("C-specificity"), "probability_gt_zero"].iloc[0]),
                "best_dynamic_model_by_elpd": str(loop[loop.outcome.eq("all")].sort_values("elpd", ascending=False).model.iloc[0])}
+    headline_did = did[(did.source_state.eq("Global")) & did.outcome.eq("J") &
+                       did.contrast.eq("matched difference-in-differences")].iloc[0]
+    summary.update({"matched_j_did_median": float(headline_did["median"]),
+                    "matched_j_did_ci95_low": float(headline_did.ci95_low),
+                    "matched_j_did_ci95_high": float(headline_did.ci95_high),
+                    "matched_j_did_probability_gt_zero": float(headline_did.probability_gt_zero),
+                    **{f"nuts_{key}": value for key, value in fit_diagnostics.items()},
+                    **{f"ppc_{key}": value for key, value in ppc.items()},
+                    **{f"recovery_{key}": value for key, value in recovery.items()}})
     non_position_balance = balance[~balance.matching_variable.eq("record_fraction")]
     summary["pseudo_max_abs_smd_excluding_record_position"] = float(
         non_position_balance.standardised_mean_difference.abs().max())
-    loss = pd.read_csv(data_dir / "advi_loss.csv").negative_elbo
-    if len(loss) >= 2000:
-        recent, previous = loss.iloc[-1000:].mean(), loss.iloc[-2000:-1000].mean()
-        summary["advi_tail_relative_change"] = float(abs(recent - previous) / abs(recent))
     (data_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     provenance = {"completed_utc": datetime.now(timezone.utc).isoformat(),
                   "microstate_fits_reused": True, "microstate_refit_performed": False,
@@ -812,8 +1132,8 @@ def run(args) -> dict:
                              if path is not None and path.exists()},
                   "code": {str(path): sha256(path) for path in
                            (Path(__file__), Path(legacy.__file__))},
-                  "model": "hierarchical multinomial ALR; source-hierarchical coefficients; participant/event random effects",
-                  "inference": "mean-field ADVI", "transition_count_as_predictor": False,
+                  "model": "destination-labelled hierarchical multinomial masked softmax; symmetric sum-to-zero allowed-destination logits; participant/event random effects",
+                  "inference": "multi-chain NUTS", "transition_count_as_predictor": False,
                   "all_source_reference_qc_threshold": 0.50,
                   "primary_outcomes": ["J", "K_H", "D_route"], "secondary_outcome": "kappa",
                   "covariates": covariates,
@@ -835,6 +1155,20 @@ def self_check() -> None:
     assert np.allclose(metrics["delta_probability"].sum(axis=-1), 0)
     counts = np.array([20, 15, 10, 5, 2])
     assert np.all(legacy.thin_counts(rng, counts, EQUALISED_TRANSITIONS, 10).sum(axis=1) == EQUALISED_TRANSITIONS)
+    assert DESTINATION_INDEX.shape == (6, 5) and len(set(EDGE_LABELS)) == 30
+    assert all(source not in DESTINATION_INDEX[source] for source in range(6))
+    probability = rng.dirichlet(np.ones(5), size=(3, 4))
+    replicated = rng.multinomial(np.array([10, 20, 30, 40]), probability)
+    assert replicated.shape == (3, 4, 5) and np.all(replicated.sum(axis=2) == np.array([10, 20, 30, 40]))
+    meta = pd.DataFrame({"participant": ["e1", "e2", "f1", "f2"] * 2,
+                         "event_key": ["e1", "e2", "f1", "f2"] * 2,
+                         "is_functional": [0, 0, 1, 1] * 2,
+                         "true_onset": [1] * 4 + [0] * 4,
+                         "window_end_to_ictus_s": [0] * 4 + [np.nan] * 4})
+    values = np.tile(np.array([1.5, 2.0, 4.0, 5.0, 1.0, 1.0, 2.0, 2.0]), (20, 1))
+    did = matched_pseudo_estimands(values, meta, "Global", "J")
+    headline = next(row for row in did if row["contrast"] == "matched difference-in-differences")
+    assert np.isclose(headline["median"], 1.75)
 
 
 def main() -> None:
@@ -846,14 +1180,25 @@ def main() -> None:
     parser.add_argument("--reference-qc-csv", type=Path, default=source / "state_reference_qc.csv")
     parser.add_argument("--out-dir", type=Path,
                         default=Path(r"C:\Users\Admin\OneDrive - NHS\FS_MS\equalised and optimised"))
-    parser.add_argument("--draws", type=int, default=500)
-    parser.add_argument("--advi-iterations", type=int, default=30000)
+    parser.add_argument("--draws", type=int, default=750)
+    parser.add_argument("--tune", type=int, default=750)
+    parser.add_argument("--chains", type=int, default=4)
+    parser.add_argument("--cores", type=int, default=2)
+    parser.add_argument("--target-accept", type=float, default=.92)
+    parser.add_argument("--ppc-draws", type=int, default=200)
+    parser.add_argument("--recovery-draws", type=int, default=300)
+    parser.add_argument("--recovery-tune", type=int, default=300)
+    parser.add_argument("--recovery-chains", type=int, default=2)
     parser.add_argument("--seed", type=int, default=30072026)
     parser.add_argument("--reuse-posterior", action="store_true")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     if args.self_check:
         self_check(); print("optimised transition self-check passed"); return
+    if args.chains < 2 or args.draws < 250 or args.tune < 250:
+        parser.error("confirmatory inference requires at least 2 chains, 250 draws and 250 tuning iterations")
+    if args.recovery_chains < 2:
+        parser.error("simulation recovery requires at least 2 chains")
     required = (args.peak_windows_csv, args.common_windows_csv, args.reference_qc_csv)
     missing = [str(path) for path in required if not path.exists()]
     if missing:

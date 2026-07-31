@@ -19,7 +19,10 @@ postictal recovery. The hierarchical multinomial model replaces the legacy
 C-origin transition models, raw-count sensitivities, route tests, pairwise
 source-specificity tests, autonomic kitchen-sink associations and long
 predictive-flow forests. The final publication stage combines only the retained
-and replacement results.
+and replacement results. Its logits use destination-labelled source→destination
+edges with a symmetric sum-to-zero constraint, so cross-source shrinkage never
+depends on a source-specific coordinate order. The confirmatory fit uses
+multiple-chain NUTS, posterior predictive checks and simulation recovery.
 
 To rebuild the curated report and publication figures from saved model outputs:
 
@@ -33,7 +36,9 @@ To rebuild the curated report and publication figures from saved model outputs:
 The final folder contains ten grouped figures as both 400-dpi PNG and vector PDF,
 curated result tables, an explicit keep/replace ledger, and complete hashes.
 Separate matched-axis 3D views show κ, J and CPI for FS and ES with event-bin
-jitter and time-bin centroid paths.
+jitter and time-bin centroid paths. The pseudo-onset panel reports the paired
+[FS genuine − FS pseudo] − [ES genuine − ES pseudo] estimand rather than an
+unmatched comparison.
 
 The optimised hierarchy can still be run directly:
 
