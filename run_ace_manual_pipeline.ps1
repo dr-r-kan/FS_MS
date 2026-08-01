@@ -17,6 +17,7 @@ $EcgQc = 'G:\FS_microstates_study\heppy_output_spmms_20260724\ecg_qc'
 $OriginalEcgQc = 'G:\FS_microstates_study\heppy_output\ecg_qc'
 $Demographics = Join-Path $Repo 'analysis_database.csv'
 $PeakWindows = Join-Path $Analysis 'data\directional_peak_backfit_windows.csv'
+$MechanisticRunner = Join-Path $Repo 'FS_action_conditioned_transition_pipeline_v5\code\run_mechanistic_extension.py'
 $Audit = Join-Path $Analysis 'pipeline_audit.json'
 $Log = Join-Path $Analysis 'pipeline_run.log'
 $Mutex = [System.Threading.Mutex]::new($false, 'Global\FSMS_FOCUSED_PIPELINE')
@@ -50,19 +51,25 @@ try {
     Start-Transcript -LiteralPath $Log -Append | Out-Null
     try { $HasMutex = $Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasMutex = $true }
     if (-not $HasMutex) { throw 'Another focused FS_MS pipeline is running.' }
-    foreach ($Path in @($Repo,$Manifest,$Python,$EcgQc,$OriginalEcgQc,$Demographics)) {
+    foreach ($Path in @($Repo,$Manifest,$Python,$EcgQc,$OriginalEcgQc,$Demographics,$MechanisticRunner)) {
         if (-not (Test-Path -LiteralPath $Path)) { throw "Missing required path: $Path" }
     }
     Set-Location -LiteralPath $Repo
     $MatRepo = Quote-Matlab $Repo; $MatManifest = Quote-Matlab $Manifest; $MatResults = Quote-Matlab $Results
 
-    Invoke-Stage 'self_checks' @((Join-Path $Analysis 'self_checks.ok')) {
+    Invoke-Stage 'self_checks' @((Join-Path $Analysis 'self_checks.ok'),
+        (Join-Path $Analysis 'mechanistic_self_checks.ok')) {
         & $Python -B analyse_focused_fs_ms.py --self-check
         if ($LASTEXITCODE -ne 0) { return }
         & $Python -B analyse_global_transition_exploration.py --self-check
         if ($LASTEXITCODE -ne 0) { return }
+        & $Python -B $MechanisticRunner --self-check
+        if ($LASTEXITCODE -ne 0) { return }
         & matlab -batch "addpath('$MatRepo'); vg=fullfile('$MatRepo','external','VG-microstates'); addpath(vg); setup_microstate_paths(vg); test_spm_mix_prior;"
-        if ($LASTEXITCODE -eq 0) { 'ok' | Set-Content -LiteralPath (Join-Path $Analysis 'self_checks.ok') }
+        if ($LASTEXITCODE -eq 0) {
+            'ok' | Set-Content -LiteralPath (Join-Path $Analysis 'self_checks.ok')
+            'ok' | Set-Content -LiteralPath (Join-Path $Analysis 'mechanistic_self_checks.ok')
+        }
     }
 
     $GlobalSolution = Join-Path $Results 'global\global_solution.mat'
@@ -150,6 +157,26 @@ try {
             --common-windows-csv (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz') `
             --focused-dir $Analysis --manifest $Manifest --demographics-csv $Demographics `
             --out-dir $PublicationAnalysis --review-dir $ReviewAnalysis --overwrite
+    } -Force
+
+    Invoke-Stage 'action_conditioned_mechanistic_extension' @(
+        (Join-Path $PublicationAnalysis 'MECHANISTIC_EXTENSION_RESULTS.md'),
+        (Join-Path $PublicationAnalysis 'MECHANISTIC_EXTENSION_AUDIT.json'),
+        (Join-Path $PublicationAnalysis 'MECHANISTIC_ANALYSIS_DECISIONS.csv'),
+        (Join-Path $PublicationAnalysis 'MODEL_SPECIFICATION.md'),
+        (Join-Path $PublicationAnalysis 'action_tensor\ACTION_TENSOR_RESULTS.md'),
+        (Join-Path $PublicationAnalysis 'action_tensor\figures\figure_07_action_conditioned_transition_tensor.png'),
+        (Join-Path $PublicationAnalysis 'action_tensor\figures\figure_08_action_tensor_validation_and_pseudo.png'),
+        (Join-Path $PublicationAnalysis 'lagged_sensitivity\ACTION_TENSOR_RESULTS.md'),
+        (Join-Path $PublicationAnalysis 'directionality\DIRECTIONALITY_RESULTS.md'),
+        (Join-Path $PublicationAnalysis 'directionality\figures\figure_09_transition_to_next_action_directionality.png'),
+        (Join-Path $ReviewAnalysis 'MECHANISTIC_EXTENSION_RESULTS.md'),
+        (Join-Path $ReviewAnalysis 'MECHANISTIC_EXTENSION_AUDIT.json')) {
+        & $Python -B $MechanisticRunner `
+            --peak-windows-csv $PeakWindows `
+            --common-windows-csv (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz') `
+            --out-root $PublicationAnalysis --review-dir $ReviewAnalysis `
+            --bootstrap-draws 2000 --run-lagged
     } -Force
     $State.result='completed'
 } catch {

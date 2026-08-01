@@ -26,6 +26,14 @@ After the global analysis, the pipeline:
 - retains the participant-matched genuine/pseudo difference-in-differences so a
   phenotype is not mislabeled as an onset-specific biomarker.
 
+The pipeline then fits the action-conditioned mechanistic extension documented
+in `FS_action_conditioned_transition_pipeline_v5/MODEL_SPECIFICATION.md`. It
+uses four softly interpolated CPI/CSI action corners, validates the interictal
+tensor participant-wise, evaluates preceding-window timing, and tests the
+reverse transition-to-next-action direction with participant-held-out models.
+The source inputs remain 60-second summaries; no transition-level causal claim
+is made.
+
 Run the complete reusable pipeline with:
 
 ```powershell
@@ -54,7 +62,10 @@ To rebuild only the global-first publication analysis from retained data:
 analysis frames, PCA loadings/scores, participant-held-out predictions,
 exploratory source models, matched-pseudo balance, decisions and hashes.
 `for_review` is a self-contained small review package with the single analysis
-script, compressed reused inputs, all result tables and figures.
+scripts, compressed reused inputs, all result tables and figures. The complete
+pipeline also adds `action_tensor/`, `lagged_sensitivity/`, `directionality/`,
+`MECHANISTIC_EXTENSION_RESULTS.md`, and `MECHANISTIC_EXTENSION_AUDIT.json` to
+both output packages.
 
 The prior confirmatory hierarchy and 3D displays are not part of the headline
 pipeline: the attempted confirmatory fits failed validation, and the 2D
