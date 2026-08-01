@@ -6,7 +6,11 @@ param(
     [string]$Analysis = 'G:\FS_microstates_study\vg_microstates\focused_analysis_final',
     [string]$PublicationAnalysis = '',
     [string]$ReviewAnalysis = '',
-    [string[]]$ManualLabels = @()
+    [string[]]$ManualLabels = @(),
+    [string]$TimestampedHierarchy = 'G:\FS_microstates_study\vg_microstates\timestamped_hierarchy_20260801',
+    [string]$TimestampedBackfits = 'G:\FS_microstates_study\vg_microstates\timestamped_backfits_20260801',
+    [switch]$RunConfirmatory,
+    [string]$PreregistrationId = ''
 )
 
 $PublicationAnalysis = if ($PublicationAnalysis) { $PublicationAnalysis } else { Join-Path (Split-Path -Parent $Analysis) 'publication_final' }
@@ -17,7 +21,9 @@ $EcgQc = 'G:\FS_microstates_study\heppy_output_spmms_20260724\ecg_qc'
 $OriginalEcgQc = 'G:\FS_microstates_study\heppy_output\ecg_qc'
 $Demographics = Join-Path $Repo 'analysis_database.csv'
 $PeakWindows = Join-Path $Analysis 'data\directional_peak_backfit_windows.csv'
-$MechanisticRunner = Join-Path $Repo 'FS_action_conditioned_transition_pipeline_v5\code\run_mechanistic_extension.py'
+$TimestampedAnalysis = Join-Path $Repo 'analyse_timestamped_transition_dynamics.py'
+$TimestampedRunner = Join-Path $Repo 'run_timestamped_transition_pipeline.ps1'
+$AutonomicNative = Join-Path $Analysis 'data\autonomic_native_ii_standardised.csv.gz'
 $Audit = Join-Path $Analysis 'pipeline_audit.json'
 $Log = Join-Path $Analysis 'pipeline_run.log'
 $Mutex = [System.Threading.Mutex]::new($false, 'Global\FSMS_FOCUSED_PIPELINE')
@@ -51,9 +57,10 @@ try {
     Start-Transcript -LiteralPath $Log -Append | Out-Null
     try { $HasMutex = $Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasMutex = $true }
     if (-not $HasMutex) { throw 'Another focused FS_MS pipeline is running.' }
-    foreach ($Path in @($Repo,$Manifest,$Python,$EcgQc,$OriginalEcgQc,$Demographics,$MechanisticRunner)) {
+    foreach ($Path in @($Repo,$Manifest,$Python,$EcgQc,$OriginalEcgQc,$Demographics,$TimestampedAnalysis,$TimestampedRunner)) {
         if (-not (Test-Path -LiteralPath $Path)) { throw "Missing required path: $Path" }
     }
+    if ($RunConfirmatory -and -not $PreregistrationId.Trim()) { throw 'RunConfirmatory requires PreregistrationId.' }
     Set-Location -LiteralPath $Repo
     $MatRepo = Quote-Matlab $Repo; $MatManifest = Quote-Matlab $Manifest; $MatResults = Quote-Matlab $Results
 
@@ -63,7 +70,8 @@ try {
         if ($LASTEXITCODE -ne 0) { return }
         & $Python -B analyse_global_transition_exploration.py --self-check
         if ($LASTEXITCODE -ne 0) { return }
-        & $Python -B $MechanisticRunner --self-check
+        & $Python -B $TimestampedAnalysis --self-check --transition-index placeholder `
+            --autonomic-native placeholder --manifest placeholder --out-dir placeholder
         if ($LASTEXITCODE -ne 0) { return }
         & matlab -batch "addpath('$MatRepo'); vg=fullfile('$MatRepo','external','VG-microstates'); addpath(vg); setup_microstate_paths(vg); test_spm_mix_prior;"
         if ($LASTEXITCODE -eq 0) {
@@ -159,27 +167,29 @@ try {
             --out-dir $PublicationAnalysis --review-dir $ReviewAnalysis --overwrite
     } -Force
 
-    Invoke-Stage 'action_conditioned_mechanistic_extension' @(
-        (Join-Path $PublicationAnalysis 'MECHANISTIC_EXTENSION_RESULTS.md'),
-        (Join-Path $PublicationAnalysis 'MECHANISTIC_EXTENSION_AUDIT.json'),
-        (Join-Path $PublicationAnalysis 'MECHANISTIC_ANALYSIS_DECISIONS.csv'),
-        (Join-Path $PublicationAnalysis 'MODEL_SPECIFICATION.md'),
-        (Join-Path $PublicationAnalysis 'action_tensor\ACTION_TENSOR_RESULTS.md'),
-        (Join-Path $PublicationAnalysis 'action_tensor\figures\figure_07_action_conditioned_transition_tensor.png'),
-        (Join-Path $PublicationAnalysis 'action_tensor\figures\figure_08_action_tensor_validation_and_pseudo.png'),
-        (Join-Path $PublicationAnalysis 'action_tensor\figures\figure_10_route_level_action_misfit.png'),
-        (Join-Path $PublicationAnalysis 'action_tensor\tables\action_route_window_estimates.csv.gz'),
-        (Join-Path $PublicationAnalysis 'action_tensor\tables\action_route_contrasts.csv'),
-        (Join-Path $PublicationAnalysis 'lagged_sensitivity\ACTION_TENSOR_RESULTS.md'),
-        (Join-Path $PublicationAnalysis 'directionality\DIRECTIONALITY_RESULTS.md'),
-        (Join-Path $PublicationAnalysis 'directionality\figures\figure_09_transition_to_next_action_directionality.png'),
-        (Join-Path $ReviewAnalysis 'MECHANISTIC_EXTENSION_RESULTS.md'),
-        (Join-Path $ReviewAnalysis 'MECHANISTIC_EXTENSION_AUDIT.json')) {
-        & $Python -B $MechanisticRunner `
-            --peak-windows-csv $PeakWindows `
-            --common-windows-csv (Join-Path $Analysis 'data\autonomic_peak_microstate_common_windows.csv.gz') `
-            --out-root $PublicationAnalysis --review-dir $ReviewAnalysis `
-            --bootstrap-draws 2000 --run-lagged
+    $TimestampedOut = Join-Path $PublicationAnalysis 'timestamped_transition'
+    $TimestampedReview = Join-Path $ReviewAnalysis 'timestamped_transition'
+    $TimestampedIndex = Join-Path $TimestampedBackfits 'transition_index.csv'
+    Invoke-Stage 'timestamped_transition_tensor' @(
+        $TimestampedIndex,
+        (Join-Path $TimestampedOut 'ANALYSIS_AUDIT.json'),
+        (Join-Path $TimestampedOut 'tables\timestamped_window_metrics.csv.gz'),
+        (Join-Path $TimestampedOut 'tables\baseline_B_tensor_precision_summary.csv'),
+        (Join-Path $TimestampedOut 'tables\confirmatory_analysis_plan_WITHHELD.csv'),
+        (Join-Path $TimestampedOut 'figures\figure_01_peri_ictal_manifold.png'),
+        (Join-Path $TimestampedOut 'figures\figure_02_matrix_js_kappa_trajectories.png'),
+        (Join-Path $TimestampedOut 'figures\figure_03_baseline_B_tensor_precision.png'),
+        (Join-Path $TimestampedReview 'SHA256SUMS.csv')) {
+        $TimestampedArguments = @{
+            Repo = $Repo; Manifest = $Manifest; Hierarchy = $TimestampedHierarchy
+            Backfits = $TimestampedBackfits; AutonomicNative = $AutonomicNative
+            ValidationWindows = $PeakWindows; Output = $TimestampedOut; Review = $TimestampedReview
+        }
+        if ($RunConfirmatory) {
+            & $TimestampedRunner @TimestampedArguments -RunConfirmatory -PreregistrationId $PreregistrationId
+        } else {
+            & $TimestampedRunner @TimestampedArguments
+        }
     } -Force
     $State.result='completed'
 } catch {
