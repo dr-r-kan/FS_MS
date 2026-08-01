@@ -1,9 +1,10 @@
 """Exact transition-time autonomic tensor and peri-ictal manifold analysis.
 
 Every row of the action tensor is built from genuine ordered microstate changes.
-CSI/CPI are linearly interpolated only within their observed heartbeat-resolved
-support. Confirmatory group tests are locked unless --run-confirmatory and a
-preregistration identifier are supplied together.
+CSI/CPI levels and their heartbeat-grid gradients are linearly interpolated only
+within observed support. The tensor uses CPI/CSI gradient quadrants; levels are
+retained descriptively. Confirmatory group tests are locked unless
+--run-confirmatory and a preregistration identifier are supplied together.
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ from sklearn.preprocessing import StandardScaler
 STATES = ("F", "E", "G", "B", "A", "C")
 FIT_LABELS = ("A", "F", "C", "G", "B", "E")
 FIT_TO_CANONICAL = np.array([STATES.index(label) for label in FIT_LABELS])
-ACTIONS = ("CPI+/CSI+", "CPI+/CSI-", "CPI-/CSI+", "CPI-/CSI-")
+ACTIONS = ("dCPI+/dCSI+", "dCPI+/dCSI-", "dCPI-/dCSI+", "dCPI-/dCSI-")
+STATE_ACTIONS = ("CPI+/CSI+", "CPI+/CSI-", "CPI-/CSI+", "CPI-/CSI-")
 TIME_BINS = ("-20 to -10", "-10 to -5", "-5 to -2", "-2 to -1", "-1 to 0")
 TIME_MIDPOINT = dict(zip(TIME_BINS, (-15, -7.5, -3.5, -1.5, -.5)))
 OFF_DIAGONAL = ~np.eye(6, dtype=bool)
@@ -109,6 +111,18 @@ def action_weights(cpi: np.ndarray, csi: np.ndarray, temperature: float = .5) ->
     if valid.any() and not np.allclose(output[valid].sum(axis=1), 1, atol=1e-12):
         raise AssertionError("Action weights do not sum to one")
     return output
+
+
+def gradient_weights(cpi_gradient: np.ndarray, csi_gradient: np.ndarray) -> np.ndarray:
+    """Soft increasing/decreasing quadrants, scaled by each record's typical absolute slope."""
+    normalised = []
+    for values in (cpi_gradient, csi_gradient):
+        valid = np.isfinite(values)
+        scale = np.nanmedian(np.abs(values[valid])) if valid.any() else np.nan
+        if not np.isfinite(scale) or scale <= 1e-12:
+            scale = np.nanstd(values[valid]) if valid.any() else np.nan
+        normalised.append(values / scale if np.isfinite(scale) and scale > 1e-12 else np.zeros_like(values))
+    return action_weights(normalised[0], normalised[1])
 
 
 def transition_counts(source: np.ndarray, destination: np.ndarray) -> np.ndarray:
@@ -227,19 +241,20 @@ def stable_sample(size: int, number: int, key: str) -> np.ndarray:
     return np.random.default_rng(seed).choice(size, number, replace=False)
 
 
-def interpolate_native(native: pd.DataFrame, times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def interpolate_native(native: pd.DataFrame, times: np.ndarray) -> tuple[np.ndarray, ...]:
     if native.empty:
         missing = np.full(len(times), np.nan)
-        return missing.copy(), missing
-    output = []
+        return missing.copy(), missing.copy(), missing.copy(), missing
+    levels, gradients = [], []
     for column in ("csi_z", "cpi_z"):
         subset = native[["event_time_s", column]].apply(pd.to_numeric, errors="coerce").dropna()
         subset = subset.groupby("event_time_s", as_index=False)[column].mean().sort_values("event_time_s")
         if len(subset) < 2:
-            output.append(np.full(len(times), np.nan)); continue
+            levels.append(np.full(len(times), np.nan)); gradients.append(np.full(len(times), np.nan)); continue
         x, y = subset.event_time_s.to_numpy(), subset[column].to_numpy()
-        output.append(np.interp(times, x, y, left=np.nan, right=np.nan))
-    return output[0], output[1]
+        levels.append(np.interp(times, x, y, left=np.nan, right=np.nan))
+        gradients.append(np.interp(times, x, np.gradient(y, x), left=np.nan, right=np.nan))
+    return levels[0], levels[1], gradients[0], gradients[1]
 
 
 def window_starts(condition: str, duration: float) -> np.ndarray:
@@ -279,19 +294,26 @@ def build_windows(index: pd.DataFrame, native: dict[str, pd.DataFrame], action_c
         times = (transition["sample"] - 1) / transition["sfreq"]
         source = FIT_TO_CANONICAL[transition["from"] - 1]
         destination = FIT_TO_CANONICAL[transition["to"] - 1]
-        csi, cpi = interpolate_native(native.get(row.file_key, pd.DataFrame()), times)
-        action = action_weights(cpi, csi)
+        csi, cpi, csi_gradient, cpi_gradient = interpolate_native(
+            native.get(row.file_key, pd.DataFrame()), times)
+        state_action = action_weights(cpi, csi)
+        action = gradient_weights(cpi_gradient, csi_gradient)
         action_file = action_cache / f"{int(row.manifest_index):04d}_{row.participant}_{row.condition}.npz"
         np.savez_compressed(action_file, transition_sample=transition["sample"].astype(np.uint32),
                             sfreq=np.array([transition["sfreq"]]), source=source.astype(np.uint8),
                             destination=destination.astype(np.uint8), csi_z=csi.astype(np.float32),
-                            cpi_z=cpi.astype(np.float32), action_weights=action.astype(np.float32))
+                            cpi_z=cpi.astype(np.float32), csi_gradient_z_per_s=csi_gradient.astype(np.float32),
+                            cpi_gradient_z_per_s=cpi_gradient.astype(np.float32),
+                            state_weights=state_action.astype(np.float32),
+                            gradient_weights=action.astype(np.float32), action_weights=action.astype(np.float32))
         valid_native = np.isfinite(action).all(axis=1)
+        valid_state = np.isfinite(state_action).all(axis=1)
         action_rows.append({"manifest_index": row.manifest_index, "participant": row.participant,
                             "condition": row.condition, "file_path": row.file_path,
                             "source_transition_cache": row.cache_file,
                             "transition_action_cache": str(action_file), "n_transitions": len(times),
                             "n_with_interpolated_action": int(valid_native.sum()),
+                            "n_with_interpolated_state": int(valid_state.sum()),
                             "interpolated_action_fraction": float(valid_native.mean()) if len(times) else np.nan,
                             "sfreq": transition["sfreq"]})
         duration = transition["n_samples"] / transition["sfreq"]
@@ -321,6 +343,11 @@ def build_windows(index: pd.DataFrame, native: dict[str, pd.DataFrame], action_c
                 "n_transitions": right - left, "n_action_transitions": int(valid_action.sum()),
                 "csi_transition_mean": np.nanmean(csi[sl]) if np.isfinite(csi[sl]).any() else np.nan,
                 "cpi_transition_mean": np.nanmean(cpi[sl]) if np.isfinite(cpi[sl]).any() else np.nan,
+                "csi_gradient_mean_z_per_s": np.nanmean(csi_gradient[sl]) if np.isfinite(csi_gradient[sl]).any() else np.nan,
+                "cpi_gradient_mean_z_per_s": np.nanmean(cpi_gradient[sl]) if np.isfinite(cpi_gradient[sl]).any() else np.nan,
+                **{f"state_weight_{name.lower().replace('/', '_').replace('+', 'pos').replace('-', 'neg')}":
+                   np.nanmean(state_action[sl, number]) if np.isfinite(state_action[sl, number]).any() else np.nan
+                   for number, name in enumerate(STATE_ACTIONS)},
             })
             ordinary.append(counts); tensor.append(weighted); ordinary30.append(c30); tensor30.append(t30)
         if record_number % 25 == 0 or record_number == len(index):
@@ -473,10 +500,11 @@ def plot_manifold(scores: pd.DataFrame, figures: Path) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(11.2, 8.0), constrained_layout=True)
     for row, representation in enumerate(("ordinary", "tensor")):
         use = scores[scores.representation.eq(representation)]
+        label = "Ordinary matrix" if representation == "ordinary" else "Gradient tensor"
         _trajectory_panel(axes[row, 0], use, "event_type", ("FS", "ES"), (FS_COLOR, ES_COLOR),
-                          f"{representation.title()} matrix: FS and ES", 11 + row)
+                          f"{label}: FS and ES", 11 + row)
         _trajectory_panel(axes[row, 1], use[use.event_type.eq("FS")], "semiology", ("hypo", "hyper"),
-                          (HYPO_COLOR, HYPER_COLOR), f"{representation.title()} matrix: FS hypo and hyper", 21 + row)
+                          (HYPO_COLOR, HYPER_COLOR), f"{label}: FS hypo and hyper", 21 + row)
     fig.suptitle("Peri-ictal movement in transition–autonomic manifold space", fontsize=13, fontweight="bold")
     save_figure(fig, figures, "figure_01_peri_ictal_manifold")
 
@@ -484,7 +512,7 @@ def plot_manifold(scores: pd.DataFrame, figures: Path) -> None:
 def plot_matrix_trajectories(metrics: pd.DataFrame, figures: Path) -> None:
     configure_style()
     values = ["ordinary_js", "ordinary_kappa", "tensor_js", "tensor_kappa"]
-    titles = ["Original matrix JS", "Original matrix κ", "Autonomic tensor JS", "Autonomic tensor κ"]
+    titles = ["Original matrix JS", "Original matrix κ", "Autonomic-gradient tensor JS", "Autonomic-gradient tensor κ"]
     event = metrics[metrics.condition.eq("preict") & metrics.time_bin.isin(TIME_BINS)].groupby(
         ["event_key", "event_type", "semiology", "time_bin"], observed=True, dropna=False,
         as_index=False)[values].mean()
@@ -514,6 +542,38 @@ def plot_matrix_trajectories(metrics: pd.DataFrame, figures: Path) -> None:
     save_figure(fig, figures, "figure_02_matrix_js_kappa_trajectories")
 
 
+def plot_autonomic_state_trajectories(metrics: pd.DataFrame, figures: Path) -> None:
+    configure_style()
+    values, titles = ("cpi_transition_mean", "csi_transition_mean"), ("CPI level", "CSI level")
+    event = metrics[metrics.condition.eq("preict") & metrics.time_bin.isin(TIME_BINS)].groupby(
+        ["event_key", "event_type", "semiology", "time_bin"], observed=True, dropna=False,
+        as_index=False)[list(values)].mean()
+    fig, axes = plt.subplots(2, 2, figsize=(8.3, 6.0), sharex=True, constrained_layout=True)
+    designs = (("event_type", event, ("FS", "ES"), (FS_COLOR, ES_COLOR), "FS versus ES"),
+               ("semiology", event[event.event_type.eq("FS")], ("hypo", "hyper"),
+                (HYPO_COLOR, HYPER_COLOR), "FS hypo versus hyper"))
+    x = np.arange(len(TIME_BINS))
+    for row, (column, frame, levels, colors, label) in enumerate(designs):
+        for col, (value, title) in enumerate(zip(values, titles)):
+            axis = axes[row, col]
+            for level, color in zip(levels, colors):
+                subset = frame[frame[column].astype(str).str.lower().eq(level.lower())]
+                cells = subset.groupby("time_bin", observed=True)[value].agg(["mean", "sem"]).reindex(TIME_BINS)
+                axis.plot(x, cells["mean"], color=color, marker="o", ms=3.5, lw=1.8, label=level.upper())
+                axis.fill_between(x, cells["mean"] - cells["sem"], cells["mean"] + cells["sem"],
+                                  color=color, alpha=.14)
+            axis.axhline(0, color="#98A2B3", lw=.7)
+            axis.set_title(title if row == 0 else "")
+            axis.grid(axis="y")
+            if col == 0: axis.set_ylabel(label)
+            axis.set_xticks(x, ["-20\n-10", "-10\n-5", "-5\n-2", "-2\n-1", "-1\n0"])
+            if row == 1: axis.set_xlabel("Minutes before onset")
+            if col == 1: axis.legend(frameon=False)
+    fig.suptitle("Autonomic state trajectories (descriptive; inference withheld)", fontsize=12.5,
+                 fontweight="bold")
+    save_figure(fig, figures, "figure_04_autonomic_state_trajectories")
+
+
 def plot_baseline_precision(precision: pd.DataFrame, figures: Path) -> None:
     configure_style()
     cells = precision[precision.group.isin(["FS", "ES"])].groupby(
@@ -530,11 +590,11 @@ def plot_baseline_precision(precision: pd.DataFrame, figures: Path) -> None:
             axis.scatter(action_number + rng.normal(0, .055, len(y)), y, s=16, color=color, alpha=.55,
                          edgecolor="white", linewidth=.3)
             if len(y): axis.scatter(action_number, np.median(y), marker="D", s=28, color="#101828", zorder=4)
-        axis.set_title(f"{group} interictal B-tensor precision")
+        axis.set_title(f"{group} interictal gradient-tensor precision")
         axis.set_xticks(range(4), ACTIONS, rotation=25, ha="right")
         axis.grid(axis="y")
     axes[0].set_ylabel("Median destination-probability 95% width")
-    fig.suptitle("Absolute baseline tensor precision by participant", fontsize=12.5, fontweight="bold")
+    fig.suptitle("Absolute baseline gradient-tensor precision by participant", fontsize=12.5, fontweight="bold")
     save_figure(fig, figures, "figure_03_baseline_B_tensor_precision")
 
 
@@ -546,6 +606,7 @@ def confirmatory_plan() -> pd.DataFrame:
                                    ("FS hypo versus hyper", "Welch participant-level t test"),
                                    ("within-DD FS versus ES", "paired participant-level t test")):
                 rows.append({"outcome": outcome, "estimand": estimand, "contrast": contrast, "test": test,
+                             "tensor_definition": "soft CPI/CSI gradient quadrants at genuine transition times",
                              "alternative": "two-sided (direction to be finalised at preregistration)",
                              "multiplicity": "Holm family-wise correction across 24 planned tests",
                              "status": "WITHHELD_PENDING_PREREGISTRATION"})
@@ -623,6 +684,13 @@ def self_check() -> None:
     weights = action_weights(cpi, csi)
     counts = transition_counts(source, destination); tensor = tensor_counts(source, destination, weights)
     assert counts.sum() == 5 and np.isclose(tensor.sum(), 5)
+    native = pd.DataFrame({"event_time_s": [0., 1., 2.], "csi_z": [0., -1., -2.], "cpi_z": [0., 2., 4.]})
+    csi_level, cpi_level, csi_gradient, cpi_gradient = interpolate_native(native, np.array([.5, 1.5, 3.]))
+    assert np.allclose(csi_level[:2], [-.5, -1.5]) and np.allclose(cpi_level[:2], [1., 3.])
+    assert np.allclose(csi_gradient[:2], -1) and np.allclose(cpi_gradient[:2], 2)
+    assert np.isnan(csi_level[2]) and np.isnan(cpi_gradient[2])
+    gradient = gradient_weights(cpi_gradient, csi_gradient)
+    assert np.all(gradient[:2, 1] > gradient[:2, [0, 2, 3]].max(axis=1))
     probability = row_probabilities(counts)
     assert np.allclose(probability.sum(axis=1), 1) and weighted_js(counts, probability) < .01
     dense = np.zeros((6, 6))
@@ -719,6 +787,7 @@ def main() -> None:
     plot_manifold(scores, figures)
     plot_matrix_trajectories(metrics, figures)
     plot_baseline_precision(precision, figures)
+    plot_autonomic_state_trajectories(metrics, figures)
     repo = Path(__file__).resolve().parent
     scripts = [Path(__file__).resolve(), repo / "recover_timestamped_transition_backfits.m",
                repo / "run_timestamped_transition_pipeline.ps1",
@@ -729,7 +798,9 @@ def main() -> None:
         "input_resolution": "genuine ordered microstate-change samples at 1/256 s with heartbeat-resolved autonomic interpolation",
         "transition_timestamps_fabricated": False,
         "autonomic_extrapolation": False,
-        "action_tensor": "fractional soft CPI/CSI weights assigned separately at each genuine transition timestamp",
+        "action_tensor": "fractional soft CPI/CSI gradient-quadrant weights assigned at each genuine transition timestamp",
+        "gradient_definition": "centred finite-difference slopes on heartbeat times, interpolated without extrapolation; soft signs scaled by record median absolute slope",
+        "autonomic_state_description": "CPI/CSI levels, soft level quadrants and peri-ictal level trajectories retained descriptively",
         "canonical_state_order": list(STATES), "action_order": list(ACTIONS),
         "minimum_transitions": 30, "exact_30_sensitivity": True,
         "route_level_hypothesis_tests": 0,
@@ -747,15 +818,15 @@ def main() -> None:
     (output / "README.md").write_text(
         "# Timestamped transition analysis\n\n"
         "This run uses every genuine ordered microstate transition at EEG-sample resolution and linearly "
-        "interpolates heartbeat-resolved CSI/CPI only within observed support. It reports original-matrix and "
-        "autonomic-conditioned tensor JS/κ, absolute interictal B-tensor precision, and descriptive peri-ictal "
+        "interpolates heartbeat-resolved CSI/CPI levels and gradients only within observed support. It reports "
+        "original-matrix and autonomic-gradient tensor JS/κ, absolute interictal gradient-tensor precision, and descriptive peri-ictal "
         "manifold movement. No route-level test family is produced. The tensor is observational; temporal "
         "interpolation does not establish causality.\n\n"
         "## Where to start\n\n"
-        "- `tables/timestamped_window_metrics.csv.gz`: original-matrix and tensor JS/κ plus exact-30 sensitivities.\n"
-        "- `tables/baseline_B_tensor_precision_summary.csv`: absolute interictal precision for FS and ES.\n"
+        "- `tables/timestamped_window_metrics.csv.gz`: original-matrix and gradient-tensor JS/κ, CPI/CSI levels and slopes, plus exact-30 sensitivities.\n"
+        "- `tables/baseline_B_tensor_precision_summary.csv`: absolute interictal gradient-tensor precision for FS and ES.\n"
         "- `tables/peri_ictal_manifold_scores.csv.gz`: event-by-period 2D movement coordinates.\n"
-        "- `transition_action_cache/*.npz`: every genuine transition sample, canonical source/destination, CSI/CPI and action weights.\n"
+        "- `transition_action_cache/*.npz`: every genuine transition sample, canonical source/destination, CPI/CSI levels, gradients, descriptive state weights and gradient-tensor weights.\n"
         "- `tables/transition_action_cache_index.csv`: links those caches to source records.\n"
         "- `PREREGISTRATION_LOCK.json`: execution status and the hash of the locked test plan.\n\n"
         + ("Confirmatory tests were run under preregistration `" + args.preregistration_id + "`.\n" if args.run_confirmatory else

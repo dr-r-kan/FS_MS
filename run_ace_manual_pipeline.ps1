@@ -179,6 +179,7 @@ try {
         (Join-Path $TimestampedOut 'figures\figure_01_peri_ictal_manifold.png'),
         (Join-Path $TimestampedOut 'figures\figure_02_matrix_js_kappa_trajectories.png'),
         (Join-Path $TimestampedOut 'figures\figure_03_baseline_B_tensor_precision.png'),
+        (Join-Path $TimestampedOut 'figures\figure_04_autonomic_state_trajectories.png'),
         (Join-Path $TimestampedReview 'SHA256SUMS.csv')) {
         $TimestampedArguments = @{
             Repo = $Repo; Manifest = $Manifest; Hierarchy = $TimestampedHierarchy
