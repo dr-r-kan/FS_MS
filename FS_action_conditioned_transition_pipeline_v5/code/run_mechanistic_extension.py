@@ -51,6 +51,9 @@ def result_summary(root: Path) -> None:
     trajectory = pd.read_csv(root / "action_tensor/tables/action_trajectory_summary.csv")
     contrasts = pd.read_csv(root / "action_tensor/tables/action_contrasts.csv")
     final = contrasts[contrasts.time_bin.eq("-1 to 0") & contrasts.contrast.eq("FS minus ES")]
+    routes = pd.read_csv(root / "action_tensor/tables/action_route_contrasts.csv")
+    final_routes = (routes[routes.time_bin.eq("-1 to 0")]
+                    .sort_values(["bh_fdr", "bootstrap_two_sided_p"]).head(10))
     lagged_path = root / "lagged_sensitivity/tables/action_contrasts.csv"
     lagged = read_optional_csv(lagged_path)
     if not lagged.empty:
@@ -89,6 +92,10 @@ def result_summary(root: Path) -> None:
         "- continuous or heartbeat-resolved CSI/CPI;",
         "- CSI/CPI interpolation only at genuine transition timestamps;",
         "- a continuous-time or semi-Markov model retaining dwell times.", "",
+        "The finest valid export is nevertheless destination-labelled: every eligible 60-second window is "
+        "expanded to its 30 off-diagonal source-to-destination routes with observed counts, model probabilities, "
+        "expected counts, residuals, and route/window per-transition log-score increments. Counted jumps are not "
+        "treated as separately timestamped observations.", "",
         "## Interictal validation", "",
         f"Action conditioning improved participant-held-out interictal log score by "
         f"**{validation.estimate:.6f} per transition** "
@@ -99,6 +106,9 @@ def result_summary(root: Path) -> None:
         "## Final-minute FS−ES contrasts", "",
         markdown_table(final[["outcome", "estimate", "ci95_low", "ci95_high", "probability_gt_zero",
                               "n_participants"]]), "",
+        "## Exploratory final-minute route contrasts", "",
+        markdown_table(final_routes[["source", "destination", "estimate", "ci95_low", "ci95_high",
+                                     "bootstrap_two_sided_p", "bh_fdr", "n_participants"]]), "",
         "## Matched pseudo-onset sensitivity", "",
         markdown_table(did[["outcome", "estimate", "ci95_low", "ci95_high", "probability_gt_zero", "n_pairs",
                             "n_participants"]]) if not did.empty else
@@ -124,6 +134,7 @@ def result_summary(root: Path) -> None:
         "remain sensitivity analyses.", "",
         "![Action-conditioned transition tensor](action_tensor/figures/figure_07_action_conditioned_transition_tensor.png)", "",
         "![Validation and pseudo-onset sensitivity](action_tensor/figures/figure_08_action_tensor_validation_and_pseudo.png)", "",
+        "![Destination-labelled route deviations](action_tensor/figures/figure_10_route_level_action_misfit.png)", "",
         "![Reverse temporal prediction](directionality/figures/figure_09_transition_to_next_action_directionality.png)", "",
     ]
     (root / "MECHANISTIC_EXTENSION_RESULTS.md").write_text("\n".join(lines), encoding="utf-8")
@@ -136,6 +147,7 @@ def append_decisions(root: Path) -> None:
         ("action-conditioned baseline", "add", "Participant II next-distinct-state tensor with nested validation"),
         ("transition precision", "add", "Fit positive kappa directly in softmax(kappa log p)"),
         ("action specificity", "add", "Lambda isolates action-dependent deviation from the action-pooled grammar"),
+        ("route-level resolution", "add", "Window x source x destination export; no invented transition timestamps"),
         ("temporal direction", "add sensitivity", "Preceding-action and reverse next-action models; observational only"),
         ("instantaneous causal model", "defer", "Requires transition timestamps, continuous CSI/CPI and dwell-time modelling"),
     ], columns=("analysis", "decision", "reason"))
@@ -151,6 +163,7 @@ def write_audit(root: Path, scripts: tuple[Path, ...], inputs: tuple[Path, ...],
         "completed_utc": datetime.now(timezone.utc).isoformat(),
         "input_resolution": "60-second transition counts and 60-second autonomic summaries",
         "instantaneous_analysis_performed": False,
+        "finest_route_resolution": "60-second window x source x destination (30 off-diagonal routes)",
         "soft_interpolation": "four action-space weights sum to one; no temporal upsampling",
         "scripts": {str(path.resolve()): sha256(path) for path in scripts},
         "inputs": {str(path.resolve()): sha256(path) for path in inputs},

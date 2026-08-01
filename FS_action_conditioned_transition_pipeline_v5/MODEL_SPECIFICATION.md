@@ -146,3 +146,13 @@ Covariate-adjusted and strict-caliper estimates are exported. The strict-caliper
 ## 11. Temporal-direction sensitivity
 
 A separate participant-held-out multinomial model tests whether current transition features predict the **next** autonomic quadrant beyond the current quadrant. It is trained on II only. This prospective model addresses temporal prediction, but neither direction is causal without intervention or stronger identification assumptions.
+
+## 12. Finest destination-labelled resolution
+
+For every eligible 60-s window, the analysis exports all 30 off-diagonal source-to-destination routes. For route \(s\to d\), it reports the observed count, Jeffreys-smoothed observed probability, interpolated action-conditioned II probability, action-pooled probability, expected count, Pearson residual, and
+
+\[
+M_{iewsd}=\log\frac{Y_{iew}(s,d)+0.5}{N_{iews}\widetilde B_{iew}(s,d)+0.5}.
+\]
+
+It also reports \(\log[\widetilde B_{iew}(s,d)/B_i^{pool}(s,d)]\), the action-versus-pooled log-score increment contributed by each counted jump on that route. This is the finest defensible conditional estimate in the supplied data. Individual jump timestamps, ordering within the window, and dwell times are not available and are not imputed. Route contrasts are exploratory, aggregate event before participant, preserve dual-diagnosis overlap in the participant bootstrap, and apply BH correction across route-by-time tests.

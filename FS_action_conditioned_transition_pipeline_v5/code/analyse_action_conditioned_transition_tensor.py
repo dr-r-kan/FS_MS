@@ -25,6 +25,8 @@ Outputs include:
 - leave-one-window-out II predictive log-score gain of the action-conditioned
   tensor over an action-pooled transition model;
 - participant-cluster bootstrap contrasts and genuine/pseudo-onset sensitivity;
+- window-by-source-by-destination probabilities, expected counts, residuals, and
+  exploratory route contrasts (the finest valid resolution of 60-s counts);
 - publication-grade PNG and vector PDF figures.
 
 The analysis is observational.  It tests an action-conditioned transition model
@@ -554,7 +556,8 @@ def evaluate_window(
     model: ActionBaselineModel,
     action_prior_strength: float,
     common_exclusion: int | None = None,
-) -> dict[str, float]:
+    return_probabilities: bool = False,
+) -> dict[str, float | np.ndarray]:
     row = model.frame.iloc[index]
     exclusion = common_exclusion if common_exclusion is not None else (index if row.condition == "ii" else None)
     baseline, pooled = model.baseline(str(row.participant), action_prior_strength, exclusion)
@@ -579,7 +582,7 @@ def evaluate_window(
                                          start=1.0, bounds=(-3.0, 3.0))
     conditional_score = log_score(model.cubes[index], interpolated)
     pooled_score = log_score(model.cubes[index], pooled)
-    return {
+    result: dict[str, float | np.ndarray] = {
         "action_js": js,
         "log_action_js": math.log(max(js, 1e-12)),
         "action_log_kappa": log_kappa,
@@ -589,6 +592,10 @@ def evaluate_window(
         "pooled_log_score": pooled_score,
         "action_log_score_gain": conditional_score - pooled_score,
     }
+    if return_probabilities:
+        result["_action_probabilities"] = interpolated
+        result["_pooled_probabilities"] = pooled
+    return result
 
 
 def tune_action_prior(
@@ -704,7 +711,7 @@ def nested_baseline_validation(
 def compute_window_metrics(
     model: ActionBaselineModel,
     action_prior_strength: float,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     metadata = [
         "row_id", "array_index", "participant", "file_path", "file_key", "event_key",
         "condition", "event_type", "semiology", "time_bin", "window_index",
@@ -714,9 +721,13 @@ def compute_window_metrics(
     ]
     metadata = [column for column in metadata if column in model.frame.columns]
     rows = []
+    action_probabilities = np.zeros_like(model.cubes, dtype=float)
+    pooled_probabilities = np.zeros_like(model.cubes, dtype=float)
     for index in range(len(model.frame)):
         row = model.frame.iloc[index]
-        result = evaluate_window(index, model, action_prior_strength)
+        result = evaluate_window(index, model, action_prior_strength, return_probabilities=True)
+        action_probabilities[index] = result.pop("_action_probabilities")
+        pooled_probabilities[index] = result.pop("_pooled_probabilities")
         entry = {column: row[column] for column in metadata}
         entry.update(result)
         entry["total_transitions"] = int(model.cubes[index].sum())
@@ -726,7 +737,129 @@ def compute_window_metrics(
     output = pd.DataFrame(rows)
     if output.row_id.duplicated().any():
         raise AssertionError("Window metrics contain duplicated row IDs")
+    source, destination = np.where(OFFDIAGONAL_MASK)
+    repeated = np.repeat(np.arange(len(model.frame)), len(source))
+    source_index = np.tile(source, len(model.frame))
+    destination_index = np.tile(destination, len(model.frame))
+    counts = model.cubes[:, source, destination].reshape(-1)
+    source_totals = model.cubes.sum(axis=2)[:, source].reshape(-1)
+    action_probability = action_probabilities[:, source, destination].reshape(-1)
+    pooled_probability = pooled_probabilities[:, source, destination].reshape(-1)
+    expected = source_totals * action_probability
+    route_metadata = [column for column in (
+        "row_id", "array_index", "participant", "event_key", "condition", "event_type",
+        "semiology", "time_bin", "window_index", "window_start_s", "window_end_s",
+        "window_end_to_ictus_s", "group", "action_csi", "action_cpi", "hard_action",
+        "action_temporal_relation",
+    ) if column in model.frame.columns]
+    routes = model.frame.iloc[repeated][route_metadata].reset_index(drop=True)
+    routes["source"] = np.asarray(STATES)[source_index]
+    routes["destination"] = np.asarray(STATES)[destination_index]
+    routes["observed_count"] = counts
+    routes["source_total"] = source_totals
+    routes["source_has_transitions"] = source_totals > 0
+    routes["observed_route_probability"] = np.where(
+        source_totals > 0, (counts + 0.5) / (source_totals + 2.5), np.nan)
+    routes["action_tensor_probability"] = action_probability
+    routes["action_pooled_probability"] = pooled_probability
+    routes["expected_count_action"] = expected
+    routes["route_log_misfit"] = np.where(
+        source_totals > 0, np.log((counts + 0.5) / (expected + 0.5)), np.nan)
+    routes["route_log_probability_ratio"] = np.log(
+        routes.observed_route_probability / np.clip(action_probability, 1e-12, 1))
+    routes["per_transition_action_vs_pooled_log_score_gain"] = np.log(
+        np.clip(action_probability, 1e-12, 1) / np.clip(pooled_probability, 1e-12, 1))
+    routes["action_log_score_contribution"] = counts * np.log(
+        np.clip(action_probability, 1e-12, 1))
+    routes["action_vs_pooled_log_score_contribution"] = counts * \
+        routes.per_transition_action_vs_pooled_log_score_gain
+    variance = expected * (1 - action_probability)
+    routes["pearson_residual"] = np.where(
+        source_totals > 0, (counts - expected) / np.sqrt(np.clip(variance, 1e-12, None)), np.nan)
+    for action, label in enumerate(ACTION_SHORT):
+        routes[f"weight_{label}"] = model.weights[repeated, action]
+    if len(routes) != 30 * len(output) or routes.groupby("row_id", observed=True).size().ne(30).any():
+        raise AssertionError("Route export must contain exactly 30 off-diagonal routes per window")
+    return output, routes
+
+
+def bh_fdr(p_values: Sequence[float]) -> np.ndarray:
+    values = np.asarray(p_values, float)
+    output = np.full(len(values), np.nan)
+    valid = np.flatnonzero(np.isfinite(values))
+    if not len(valid):
+        return output
+    order = valid[np.argsort(values[valid])]
+    adjusted = values[order] * len(order) / np.arange(1, len(order) + 1)
+    output[order] = np.minimum.accumulate(adjusted[::-1])[::-1].clip(0, 1)
     return output
+
+
+def route_level_analysis(
+    routes: pd.DataFrame,
+    draws: int,
+    seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Aggregate route deviations without pretending that counted jumps are timestamped rows."""
+    preictal = routes[
+        routes.condition.eq("preict")
+        & routes.event_type.isin(("functional", "epileptic"))
+        & routes.time_bin.isin(TIME_BINS)
+    ].copy()
+    event = (preictal.groupby(
+        ["participant", "event_key", "event_type", "semiology", "time_bin", "source", "destination"],
+        observed=True, dropna=False)
+        .agg(observed_count=("observed_count", "sum"),
+             expected_count_action=("expected_count_action", "sum"),
+             n_windows=("row_id", "nunique"))
+        .reset_index())
+    event = event[event.expected_count_action.gt(0)].copy()
+    event["route_log_misfit"] = np.log(
+        (event.observed_count + 0.5) / (event.expected_count_action + 0.5))
+    cells = (event.groupby(
+        ["participant", "event_type", "time_bin", "source", "destination"], observed=True)
+        .agg(route_log_misfit=("route_log_misfit", "mean"),
+             n_events=("event_key", "nunique"),
+             observed_count=("observed_count", "sum"),
+             expected_count_action=("expected_count_action", "sum"))
+        .reset_index())
+    cells["group"] = cells.event_type.map({"functional": "FS", "epileptic": "ES"})
+    rng = np.random.default_rng(seed)
+    summary_rows = []
+    contrast_rows = []
+    for time_bin in TIME_BINS:
+        for source in STATES:
+            for destination in STATES:
+                if source == destination:
+                    continue
+                part = cells[
+                    cells.time_bin.eq(time_bin) & cells.source.eq(source)
+                    & cells.destination.eq(destination)
+                ]
+                for group in ("FS", "ES"):
+                    values = part.loc[part.group.eq(group), "route_log_misfit"].to_numpy(float)
+                    estimate, low, high, probability = bootstrap_mean(values, rng, draws)
+                    summary_rows.append({
+                        "group": group, "time_bin": time_bin, "source": source,
+                        "destination": destination, "estimate": estimate, "ci95_low": low,
+                        "ci95_high": high, "probability_gt_zero": probability,
+                        "n_participants": int(np.isfinite(values).sum()),
+                    })
+                estimate, low, high, probability, n_participants, n_fs, n_es = \
+                    participant_cluster_difference(
+                        part, "route_log_misfit", "FS", "ES", draws, rng)
+                contrast_rows.append({
+                    "contrast": "FS minus ES", "time_bin": time_bin, "source": source,
+                    "destination": destination, "estimate": estimate, "ci95_low": low,
+                    "ci95_high": high, "probability_gt_zero": probability,
+                    "bootstrap_two_sided_p": 2 * min(probability, 1 - probability),
+                    "n_participants": n_participants, "n_fs": n_fs, "n_es": n_es,
+                    "estimator": "participant-cluster bootstrap preserving dual-diagnosis overlap",
+                })
+    summary = pd.DataFrame(summary_rows)
+    contrasts = pd.DataFrame(contrast_rows)
+    contrasts["bh_fdr"] = bh_fdr(contrasts.bootstrap_two_sided_p)
+    return event, cells, summary, contrasts
 
 
 def participant_cells(window_metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1508,6 +1641,53 @@ def plot_baseline_tensor_heatmaps(probabilities: pd.DataFrame, figures: Path) ->
     save_figure(fig, figures, "figure_S7_interictal_action_transition_tensors")
 
 
+def plot_route_level_misfit(
+    summary: pd.DataFrame,
+    contrasts: pd.DataFrame,
+    figures: Path,
+) -> None:
+    """Compact final-minute source-by-destination view at the data's finest valid resolution."""
+    configure_style()
+    final_summary = summary[summary.time_bin.eq("-1 to 0")]
+    final_contrasts = contrasts[contrasts.time_bin.eq("-1 to 0")]
+    matrices = []
+    for group in ("FS", "ES"):
+        matrix = np.full((6, 6), np.nan)
+        for row in final_summary[final_summary.group.eq(group)].itertuples(index=False):
+            matrix[STATES.index(row.source), STATES.index(row.destination)] = row.estimate
+        matrices.append(matrix)
+    difference = np.full((6, 6), np.nan)
+    significant = np.zeros((6, 6), dtype=bool)
+    for row in final_contrasts.itertuples(index=False):
+        source = STATES.index(row.source); destination = STATES.index(row.destination)
+        difference[source, destination] = row.estimate
+        significant[source, destination] = bool(np.isfinite(row.bh_fdr) and row.bh_fdr < 0.05)
+    matrices.append(difference)
+    maximum = max(float(np.nanmax(np.abs(matrix))) for matrix in matrices)
+    fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.65), constrained_layout=True)
+    titles = ("FS", "ES", "FS − ES")
+    image = None
+    for index, (axis, title, matrix) in enumerate(zip(axes, titles, matrices)):
+        image = axis.imshow(matrix, cmap="coolwarm", vmin=-maximum, vmax=maximum)
+        axis.set_xticks(range(6), STATES)
+        axis.set_yticks(range(6), STATES if index == 0 else [])
+        axis.set_xlabel("Destination")
+        if index == 0:
+            axis.set_ylabel("Source")
+        axis.set_title(title)
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+        panel(axis, chr(ord("A") + index))
+    rows, columns = np.where(significant)
+    axes[2].scatter(columns, rows, marker="o", s=14, facecolors="none",
+                    edgecolors="black", linewidths=0.8)
+    if image is not None:
+        fig.colorbar(image, ax=axes, fraction=0.025, pad=0.02,
+                     label="Route log misfit: observed vs action-conditioned II")
+    fig.suptitle("Final-minute destination-labelled route deviations", fontsize=10)
+    save_figure(fig, figures, "figure_10_route_level_action_misfit")
+
+
 def write_results(
     out_dir: Path,
     config: ActionTensorConfig,
@@ -1518,6 +1698,7 @@ def write_results(
     contrasts: pd.DataFrame,
     did: pd.DataFrame,
     caliper_did: pd.DataFrame,
+    route_contrasts: pd.DataFrame,
     counts: dict,
 ) -> None:
     final_summary = summary[summary.time_bin.eq("-1 to 0")]
@@ -1541,6 +1722,8 @@ def write_results(
         did_adjusted = did[did.estimator.astype(str).str.startswith("covariate-adjusted")]
     else:
         did_adjusted = pd.DataFrame()
+    final_routes = (route_contrasts[route_contrasts.time_bin.eq("-1 to 0")]
+                    .sort_values(["bh_fdr", "bootstrap_two_sided_p"]).head(10))
 
     def reference_statement(name: str, interval: tuple[float, float, float]) -> str:
         estimate, low, high = interval
@@ -1586,6 +1769,16 @@ def write_results(
         reference_statement("ES κ", es_k),
         "The code therefore reports the requested FS<1 and ES>1 pattern only if the intervals support it; "
         "it does not encode that pattern as an assumption.", "",
+        "## Finest available route resolution", "",
+        "`action_route_window_estimates.csv.gz` exports one row for every 60-second window, source state, "
+        "and off-diagonal destination (30 routes per window). It includes the observed count, smoothed "
+        "observed probability, action-conditioned II probability, expected count, route residuals, and the "
+        "per-transition action-versus-pooled log-score increment. The latter is a route/window estimand shared "
+        "by all counted jumps on that route; transition order and individual timestamps are unavailable and "
+        "were not imputed.", "",
+        "Route contrasts are exploratory participant-cluster bootstrap estimates with BH correction across "
+        "all route-by-time tests.", "",
+        markdown_table(final_routes) if not final_routes.empty else "No route contrasts.", "",
         "## Interpretation guardrail", "",
         "The empirical tensor estimates P(next distinct microstate | current microstate, autonomic action proxy). "
         "It is an observation-level analogue of an action-conditioned transition model, not an identified "
@@ -1625,10 +1818,12 @@ def run_analysis(
     nested_validation_participants, validation = nested_baseline_validation(
         candidate_participant_scores, config.bootstrap_draws, config.seed + 2)
     print(f"[action tensor] selected prior={selected_prior:g}; computing window metrics", flush=True)
-    window_metrics = compute_window_metrics(model, selected_prior)
+    window_metrics, route_windows = compute_window_metrics(model, selected_prior)
     print("[action tensor] aggregating and bootstrapping", flush=True)
     event, cells = participant_cells(window_metrics)
     summary, contrasts = trajectory_summaries(cells, config.bootstrap_draws, config.seed + 1)
+    route_event, route_cells, route_summary, route_contrasts = route_level_analysis(
+        route_windows, config.bootstrap_draws, config.seed + 41)
     apparent_validation_participants, apparent_validation = baseline_validation(
         window_metrics, config.bootstrap_draws, config.seed + 22)
     occupancy = action_occupancy(window_metrics)
@@ -1657,6 +1852,11 @@ def run_analysis(
         "action_participant_period_cells.csv": cells,
         "action_trajectory_summary.csv": summary,
         "action_contrasts.csv": contrasts,
+        "action_route_window_estimates.csv.gz": route_windows,
+        "action_route_event_bin_cells.csv.gz": route_event,
+        "action_route_participant_cells.csv.gz": route_cells,
+        "action_route_summary.csv": route_summary,
+        "action_route_contrasts.csv": route_contrasts,
         "action_baseline_tuning.csv": tuning,
         "action_prior_candidate_participant_scores.csv": candidate_participant_scores,
         "action_baseline_validation_participants.csv": nested_validation_participants,
@@ -1683,6 +1883,7 @@ def run_analysis(
             plot_validation_figure(nested_validation_participants, validation, balance, did, figures, config.seed + 4)
             plot_caliper_pseudo_sensitivity(balance, did, caliper_balance, caliper_did, figures)
         plot_baseline_tensor_heatmaps(baseline_probabilities, figures)
+        plot_route_level_misfit(route_summary, route_contrasts, figures)
 
     counts = {
         "eligible_windows": len(frame),
@@ -1691,13 +1892,16 @@ def run_analysis(
         "participants_with_ii_reference": len(model.action_counts),
         "participants_in_preictal_cells": event.participant.nunique(),
         "preictal_events": event.event_key.nunique(),
+        "route_window_rows": len(route_windows),
+        "route_event_bin_rows": len(route_event),
+        "route_participant_cell_rows": len(route_cells),
         "matched_action_pseudo_pairs": len(paired),
         "matched_action_pseudo_participants": paired.participant.nunique() if not paired.empty else 0,
         "caliper_matched_action_pseudo_pairs": len(caliper_paired),
         "caliper_matched_action_pseudo_participants": caliper_paired.participant.nunique() if not caliper_paired.empty else 0,
     }
     write_results(out_dir, config, selected_prior, tuning, validation, summary, contrasts,
-                  did, caliper_did, counts)
+                  did, caliper_did, route_contrasts, counts)
     audit = {
         "completed_utc": datetime.now(timezone.utc).isoformat(),
         "code": str(Path(__file__).resolve()),
@@ -1724,6 +1928,8 @@ def run_analysis(
             "baseline_validation": "participant-nested II leave-one-window-out action-conditioned minus action-pooled log score per transition",
             "pseudo_reference": "common participant II tensor with matched pseudo-window removed for both pair members",
             "pseudo_matching": "exact participant and action quadrant; late-record candidate threshold; covariate-adjusted participant-cluster DiD",
+            "route_resolution": "60-second window x source x destination; 30 off-diagonal routes per window; counted transitions remain multiplicities because transition timestamps are unavailable",
+            "route_misfit": "log((observed route count + 0.5) / (action-conditioned expected route count + 0.5))",
         },
         "software": {name: importlib.metadata.version(name) for name in
                      ("numpy", "pandas", "scipy", "matplotlib")},
