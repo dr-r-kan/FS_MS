@@ -170,9 +170,13 @@ try {
     $TimestampedOut = Join-Path $PublicationAnalysis 'timestamped_transition'
     $TimestampedReview = Join-Path $ReviewAnalysis 'timestamped_transition'
     $TimestampedIndex = Join-Path $TimestampedBackfits 'transition_index.csv'
-    Invoke-Stage 'timestamped_transition_tensor' @(
+    $TimestampedOutputs = @(
         $TimestampedIndex,
         (Join-Path $TimestampedOut 'ANALYSIS_AUDIT.json'),
+        (Join-Path $TimestampedOut 'OSF_PREREGISTRATION_BLURBS.md'),
+        (Join-Path $TimestampedOut 'POST_REGISTRATION_RUNBOOK.md'),
+        (Join-Path $TimestampedOut 'PREREGISTRATION_LOCK.json'),
+        (Join-Path $TimestampedOut 'PREREGISTRATION_LOCK.sha256'),
         (Join-Path $TimestampedOut 'tables\timestamped_window_metrics.csv.gz'),
         (Join-Path $TimestampedOut 'tables\baseline_B_tensor_precision_summary.csv'),
         (Join-Path $TimestampedOut 'tables\confirmatory_analysis_plan_WITHHELD.csv'),
@@ -180,7 +184,12 @@ try {
         (Join-Path $TimestampedOut 'figures\figure_02_matrix_js_kappa_trajectories.png'),
         (Join-Path $TimestampedOut 'figures\figure_03_baseline_B_tensor_precision.png'),
         (Join-Path $TimestampedOut 'figures\figure_04_autonomic_state_trajectories.png'),
-        (Join-Path $TimestampedReview 'SHA256SUMS.csv')) {
+        (Join-Path $TimestampedReview 'SHA256SUMS.csv'))
+    if ($RunConfirmatory) {
+        $TimestampedOutputs += (Join-Path $TimestampedOut 'tables\confirmatory_results.csv')
+        $TimestampedOutputs += (Join-Path $TimestampedOut 'CONFIRMATORY_EXECUTION.json')
+    }
+    Invoke-Stage 'timestamped_transition_tensor' $TimestampedOutputs {
         $TimestampedArguments = @{
             Repo = $Repo; Manifest = $Manifest; Hierarchy = $TimestampedHierarchy
             Backfits = $TimestampedBackfits; AutonomicNative = $AutonomicNative

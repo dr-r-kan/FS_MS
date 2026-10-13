@@ -22,7 +22,9 @@ $HasMutex = $false
 try {
     try { $HasMutex = $Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasMutex = $true }
     if (-not $HasMutex) { throw 'Another timestamped transition pipeline is running.' }
-    foreach ($Path in @($Repo,$Manifest,$AutonomicNative,$ValidationWindows,$Python)) {
+    $RequiredPaths = @($Repo,$Manifest,$AutonomicNative,$Python)
+    if (-not $RunConfirmatory) { $RequiredPaths += $ValidationWindows }
+    foreach ($Path in $RequiredPaths) {
         if (-not (Test-Path -LiteralPath $Path)) { throw "Missing required path: $Path" }
     }
     if ($RunConfirmatory -and -not $PreregistrationId.Trim()) {
@@ -33,16 +35,20 @@ try {
         --transition-index placeholder --autonomic-native placeholder --manifest placeholder --out-dir placeholder
     if ($LASTEXITCODE -ne 0) { throw 'Timestamped Python self-check failed.' }
 
-    $GlobalSolution = Join-Path $Hierarchy 'global\global_solution.mat'
-    if (-not (Test-Path -LiteralPath $GlobalSolution)) {
-        & matlab -batch "labels=$Labels; addpath('$($Repo.Replace("'", "''"))'); run_vg_microstates('$($Manifest.Replace("'", "''"))','$($Hierarchy.Replace("'", "''"))','global_manual_labels',labels,'global_only',true,'interactive_global_labelling',false,'require_template_labels',false,'run_backfit',false,'run_topoplots',false,'run_tanova',false,'compact_results_mat',true);"
-        if ($LASTEXITCODE -ne 0) { throw 'Deterministic global fit failed.' }
-    }
-    & matlab -batch "labels=$Labels; addpath('$($Repo.Replace("'", "''"))'); run_vg_microstates('$($Manifest.Replace("'", "''"))','$($Hierarchy.Replace("'", "''"))','global_manual_labels',labels,'interactive_global_labelling',false,'spm_prior_weight',1,'run_backfit',false,'run_participant_condition_fits',false,'run_global_backfit',false,'run_cardiac_phase',false,'run_legacy_analyses',false,'run_topoplots',false,'run_tanova',false,'compact_results_mat',true);"
-    if ($LASTEXITCODE -ne 0) { throw 'Participant-level hierarchy recovery failed.' }
+    if (-not $RunConfirmatory) {
+        $GlobalSolution = Join-Path $Hierarchy 'global\global_solution.mat'
+        if (-not (Test-Path -LiteralPath $GlobalSolution)) {
+            & matlab -batch "labels=$Labels; addpath('$($Repo.Replace("'", "''"))'); run_vg_microstates('$($Manifest.Replace("'", "''"))','$($Hierarchy.Replace("'", "''"))','global_manual_labels',labels,'global_only',true,'interactive_global_labelling',false,'require_template_labels',false,'run_backfit',false,'run_topoplots',false,'run_tanova',false,'compact_results_mat',true);"
+            if ($LASTEXITCODE -ne 0) { throw 'Deterministic global fit failed.' }
+        }
+        & matlab -batch "labels=$Labels; addpath('$($Repo.Replace("'", "''"))'); run_vg_microstates('$($Manifest.Replace("'", "''"))','$($Hierarchy.Replace("'", "''"))','global_manual_labels',labels,'interactive_global_labelling',false,'spm_prior_weight',1,'run_backfit',false,'run_participant_condition_fits',false,'run_global_backfit',false,'run_cardiac_phase',false,'run_legacy_analyses',false,'run_topoplots',false,'run_tanova',false,'compact_results_mat',true);"
+        if ($LASTEXITCODE -ne 0) { throw 'Participant-level hierarchy recovery failed.' }
 
-    & matlab -batch "addpath('$($Repo.Replace("'", "''"))'); recover_timestamped_transition_backfits('$($Manifest.Replace("'", "''"))','$($Hierarchy.Replace("'", "''"))','$($Backfits.Replace("'", "''"))','validation_windows_csv','$($ValidationWindows.Replace("'", "''"))');"
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Index)) { throw 'Exact transition export failed.' }
+        & matlab -batch "addpath('$($Repo.Replace("'", "''"))'); recover_timestamped_transition_backfits('$($Manifest.Replace("'", "''"))','$($Hierarchy.Replace("'", "''"))','$($Backfits.Replace("'", "''"))','validation_windows_csv','$($ValidationWindows.Replace("'", "''"))');"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Index)) { throw 'Exact transition export failed.' }
+    } elseif (-not (Test-Path -LiteralPath $Index)) {
+        throw "Frozen transition index is missing: $Index"
+    }
 
     $Arguments = @('-B','analyse_timestamped_transition_dynamics.py',
         '--transition-index',$Index,'--autonomic-native',$AutonomicNative,'--manifest',$Manifest,

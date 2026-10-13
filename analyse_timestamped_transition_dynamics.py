@@ -25,9 +25,10 @@ import numpy as np
 import pandas as pd
 from scipy.io import loadmat
 from scipy.special import expit
-from scipy.stats import beta, ttest_ind, ttest_rel
+from scipy.stats import beta, t as student_t, ttest_ind, ttest_rel
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+import statsmodels.api as sm
 
 
 STATES = ("F", "E", "G", "B", "A", "C")
@@ -65,6 +66,15 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def write_text_exact(path: Path, value: str) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(value)
 
 
 def save_figure(fig: plt.Figure, directory: Path, stem: str) -> None:
@@ -603,14 +613,40 @@ def confirmatory_plan() -> pd.DataFrame:
     for outcome in ("log_ordinary_js", "log_ordinary_kappa", "log_tensor_js", "log_tensor_kappa"):
         for estimand in ("final_minute", "final_minus_early"):
             for contrast, test in (("FS versus ES", "Welch participant-level t test"),
-                                   ("FS hypo versus hyper", "Welch participant-level t test"),
+                                   ("FS hypo versus hyper", "participant-clustered OLS on participant-by-semiology means"),
                                    ("within-DD FS versus ES", "paired participant-level t test")):
                 rows.append({"outcome": outcome, "estimand": estimand, "contrast": contrast, "test": test,
                              "tensor_definition": "soft CPI/CSI gradient quadrants at genuine transition times",
-                             "alternative": "two-sided (direction to be finalised at preregistration)",
+                             "alternative": "two-sided",
                              "multiplicity": "Holm family-wise correction across 24 planned tests",
                              "status": "WITHHELD_PENDING_PREREGISTRATION"})
     return pd.DataFrame(rows)
+
+
+def clustered_hypo_hyper(frame: pd.DataFrame) -> dict[str, float | int]:
+    """Estimate hyper-minus-hypo while retaining participants represented in either or both strata."""
+    values = frame[frame.semiology.astype(str).str.lower().isin(("hypo", "hyper"))].copy()
+    values = values.dropna(subset=["participant", "value"])
+    values["is_hyper"] = values.semiology.astype(str).str.lower().eq("hyper").astype(float)
+    counts = values.groupby("semiology", observed=True).size()
+    overlap = values.groupby("participant", observed=True).is_hyper.nunique().ge(2).sum()
+    if values.participant.nunique() < 3 or values.is_hyper.nunique() < 2:
+        return {"estimate": np.nan, "t": np.nan, "p": np.nan,
+                "n_first": int(counts.get("hypo", 0)), "n_second": int(counts.get("hyper", 0)),
+                "n_clusters": int(values.participant.nunique()), "n_overlap": int(overlap),
+                "df": np.nan, "ci95_low": np.nan, "ci95_high": np.nan}
+    design = sm.add_constant(values[["is_hyper"]], has_constant="add")
+    fitted = sm.OLS(values.value.to_numpy(), design.to_numpy()).fit()
+    robust = fitted.get_robustcov_results(
+        cov_type="cluster", groups=values.participant.to_numpy(),
+        use_correction=True, df_correction=True, use_t=True)
+    confidence = robust.conf_int(alpha=.05)[1]
+    return {"estimate": float(robust.params[1]), "t": float(robust.tvalues[1]),
+            "p": float(robust.pvalues[1]), "n_first": int(counts.get("hypo", 0)),
+            "n_second": int(counts.get("hyper", 0)),
+            "n_clusters": int(values.participant.nunique()), "n_overlap": int(overlap),
+            "df": float(getattr(robust, "df_resid_inference", robust.df_resid)),
+            "ci95_low": float(confidence[0]), "ci95_high": float(confidence[1])}
 
 
 def run_confirmatory(metrics: pd.DataFrame, preregistration_id: str) -> pd.DataFrame:
@@ -625,28 +661,50 @@ def run_confirmatory(metrics: pd.DataFrame, preregistration_id: str) -> pd.DataF
         event = final.merge(early, on=keys, how="inner", validate="one_to_one")
         event["final_minus_early"] = event.final_minute - event.early
         for estimand in ("final_minute", "final_minus_early"):
-            participant = event.groupby(
-                ["participant", "group", "event_type", "semiology"], observed=True, dropna=False,
-                as_index=False)[estimand].mean().rename(columns={estimand: "value"})
-            designs = [
-                ("FS versus ES", participant[participant.group.isin(["FS", "ES"])], "event_type", "FS", "ES", False),
-                ("FS hypo versus hyper", participant[participant.event_type.eq("FS")], "semiology", "hypo", "hyper", False),
-            ]
-            for name, frame, column, first, second, paired in designs:
-                a = frame[frame[column].astype(str).str.lower().eq(first.lower())].value.dropna()
-                b = frame[frame[column].astype(str).str.lower().eq(second.lower())].value.dropna()
-                test = ttest_ind(a, b, equal_var=False) if len(a) > 1 and len(b) > 1 else None
-                rows.append({"preregistration_id": preregistration_id, "outcome": outcome, "estimand": estimand,
-                             "contrast": name, "estimate": a.mean() - b.mean(), "t": test.statistic if test else np.nan,
-                             "p": test.pvalue if test else np.nan, "n_first": len(a), "n_second": len(b)})
-            dd = (participant[participant.group.eq("DD")].groupby(
-                ["participant", "event_type"], observed=True, as_index=False).value.mean()
-                  .pivot(index="participant", columns="event_type", values="value").dropna())
-            test = ttest_rel(dd.FS, dd.ES) if {"FS", "ES"}.issubset(dd) and len(dd) > 1 else None
+            independent = event[event.group.isin(["FS", "ES"])].groupby(
+                ["participant", "group"], observed=True, as_index=False)[estimand].mean().rename(
+                    columns={estimand: "value"})
+            fs = independent[independent.group.eq("FS")].value.dropna()
+            es = independent[independent.group.eq("ES")].value.dropna()
+            test = ttest_ind(fs, es, equal_var=False) if len(fs) > 1 and len(es) > 1 else None
+            estimate = fs.mean() - es.mean()
+            fs_component = fs.var(ddof=1) / len(fs) if len(fs) > 1 else np.nan
+            es_component = es.var(ddof=1) / len(es) if len(es) > 1 else np.nan
+            standard_error = np.sqrt(fs_component + es_component)
+            df = ((fs_component + es_component) ** 2 /
+                  (fs_component ** 2 / (len(fs) - 1) + es_component ** 2 / (len(es) - 1))) if test else np.nan
+            margin = student_t.ppf(.975, df) * standard_error if test else np.nan
             rows.append({"preregistration_id": preregistration_id, "outcome": outcome, "estimand": estimand,
-                         "contrast": "within-DD FS versus ES", "estimate": (dd.FS - dd.ES).mean() if len(dd) else np.nan,
+                         "contrast": "FS versus ES", "test": "Welch participant-level t test",
+                         "estimate_direction": "FS minus ES", "estimate": estimate,
                          "t": test.statistic if test else np.nan, "p": test.pvalue if test else np.nan,
-                         "n_first": len(dd), "n_second": len(dd)})
+                         "n_first": len(fs), "n_second": len(es), "n_clusters": len(fs) + len(es),
+                         "n_overlap": 0, "df": df, "ci95_low": estimate - margin,
+                         "ci95_high": estimate + margin})
+            semiology = event[event.event_type.eq("FS") & event.semiology.isin(("hypo", "hyper"))].groupby(
+                ["participant", "semiology"], observed=True, as_index=False)[estimand].mean().rename(
+                    columns={estimand: "value"})
+            semiology_result = clustered_hypo_hyper(semiology)
+            rows.append({"preregistration_id": preregistration_id, "outcome": outcome, "estimand": estimand,
+                         "contrast": "FS hypo versus hyper",
+                         "test": "participant-clustered OLS on participant-by-semiology means",
+                         "estimate_direction": "hyper minus hypo", **semiology_result})
+            dd = (event[event.group.eq("DD")].groupby(
+                ["participant", "event_type"], observed=True, as_index=False)[estimand].mean()
+                  .pivot(index="participant", columns="event_type", values=estimand).dropna())
+            test = ttest_rel(dd.FS, dd.ES) if {"FS", "ES"}.issubset(dd) and len(dd) > 1 else None
+            paired_difference = dd.FS - dd.ES if len(dd) else pd.Series(dtype=float)
+            estimate = paired_difference.mean() if len(dd) else np.nan
+            df = len(dd) - 1 if test else np.nan
+            margin = (student_t.ppf(.975, df) * paired_difference.std(ddof=1) / np.sqrt(len(dd))
+                      if test else np.nan)
+            rows.append({"preregistration_id": preregistration_id, "outcome": outcome, "estimand": estimand,
+                         "contrast": "within-DD FS versus ES", "test": "paired participant-level t test",
+                         "estimate_direction": "FS minus ES", "estimate": estimate,
+                         "t": test.statistic if test else np.nan, "p": test.pvalue if test else np.nan,
+                         "n_first": len(dd), "n_second": len(dd), "n_clusters": len(dd),
+                         "n_overlap": len(dd), "df": df, "ci95_low": estimate - margin,
+                         "ci95_high": estimate + margin})
     result = pd.DataFrame(rows)
     valid = result.p.notna()
     if valid.any():
@@ -658,18 +716,274 @@ def run_confirmatory(metrics: pd.DataFrame, preregistration_id: str) -> pd.DataF
     return result
 
 
+def sample_summary(metrics: pd.DataFrame) -> dict[str, object]:
+    preictal = metrics[metrics.condition.eq("preict")]
+    selected = preictal[preictal.time_bin.isin((TIME_BINS[0], TIME_BINS[-1]))]
+    event_bins = selected.groupby(
+        ["participant", "event_key", "group", "event_type", "semiology"],
+        observed=True, dropna=False).time_bin.nunique().reset_index(name="n_bins")
+    complete = event_bins[event_bins.n_bins.eq(2)]
+    fs = complete[complete.event_type.eq("FS") & complete.semiology.isin(("hypo", "hyper"))]
+    overlap = fs.groupby("participant", observed=True).semiology.nunique().eq(2).sum()
+    dd = (complete[complete.group.eq("DD")].groupby(
+        ["participant", "event_type"], observed=True).size().unstack().dropna())
+    return {
+        "analysis_ready_participants": int(metrics.participant.nunique()),
+        "participants_by_diagnostic_group": {
+            str(key): int(value) for key, value in metrics.groupby("group", observed=True).participant.nunique().items()},
+        "preictal_events_by_event_type": {
+            str(key): int(value) for key, value in preictal.groupby("event_type", observed=True).event_key.nunique().items()},
+        "complete_early_and_final_events_by_event_type": {
+            str(key): int(value) for key, value in complete.groupby("event_type", observed=True).event_key.nunique().items()},
+        "independent_complete_participants": {
+            str(key): int(value) for key, value in complete[complete.group.isin(("FS", "ES"))].groupby(
+                "group", observed=True).participant.nunique().items()},
+        "fs_complete_events_by_semiology": {
+            str(key): int(value) for key, value in fs.groupby("semiology", observed=True).event_key.nunique().items()},
+        "fs_complete_participants_by_semiology": {
+            str(key): int(value) for key, value in fs.groupby("semiology", observed=True).participant.nunique().items()},
+        "fs_semiology_participant_clusters": int(fs.participant.nunique()),
+        "fs_participants_in_both_semiology_strata": int(overlap),
+        "paired_dd_complete_participants": int(len(dd)),
+    }
+
+
+def osf_preregistration_blurbs(summary: dict[str, object]) -> str:
+    groups = summary["participants_by_diagnostic_group"]
+    events = summary["preictal_events_by_event_type"]
+    complete = summary["complete_early_and_final_events_by_event_type"]
+    independent = summary["independent_complete_participants"]
+    semi_events = summary["fs_complete_events_by_semiology"]
+    semi_participants = summary["fs_complete_participants_by_semiology"]
+    return f"""# OSF preregistration paste-ready blurbs
+
+## Title
+Exact-timestamp microstate transition dynamics and autonomic-gradient tensors in functional and epileptic seizures.
+
+## Research question
+Do functional seizures (FS) and epileptic seizures (ES) differ in global transition-matrix divergence and baseline-oriented concentration immediately before onset, and in their change from an early preictal interval? We will also test FS semiology and within-participant diagnostic contrasts.
+
+## Hypotheses
+We will test two-sided differences in ordinary-matrix and autonomic-gradient-tensor JS divergence and κ for: (1) independent FS versus ES groups, (2) hypomotor versus hypermotor FS, and (3) paired FS versus ES events in dual-diagnosis (DD) participants. Each contrast is tested for the final minute and for final-minus-early change. Directional interpretation will follow the signed estimates but significance testing is two-sided.
+
+## Study type and design
+This is a preregistered confirmatory analysis of an existing observational EEG/ECG dataset. Microstate transitions are observed at their genuine EEG sample timestamps (1/256 s). Heartbeat-resolved CSI/CPI levels and finite-difference gradients are interpolated only within observed temporal support. No exposure is randomized or manipulated.
+
+## Existing data and prior knowledge
+Data collection and preprocessing are complete. The analysis pipeline and descriptive plots have been developed and inspected. The 24 confirmatory group/semiology p-values have not been run; they remain software-locked pending an immutable OSF registration. This timing and all prior descriptive access will be disclosed.
+
+## Registration timing
+This is a preregistration of analyses on existing data, not a prospective registration before data collection. Registration will be made immutable before the locked confirmatory command is run. Descriptive access and pipeline development occurred before registration; confirmatory results did not.
+
+## Data collection procedure
+EEG and ECG were recorded during interictal periods and around clinically classified FS and ES events. Previously fitted six-state microstate backfits are reused. Ordered state changes are extracted at native EEG sample resolution, and heartbeat-resolved autonomic summaries are aligned to those genuine transition times without extrapolation.
+
+## Sampling and sample size
+The locked analysis-ready dataset contains {summary['analysis_ready_participants']} participants (FS={groups.get('FS', 0)}, ES={groups.get('ES', 0)}, DD={groups.get('DD', 0)}) and {events.get('FS', 0)} FS plus {events.get('ES', 0)} ES preictal events. Complete early-and-final coverage is available for {complete.get('FS', 0)} FS and {complete.get('ES', 0)} ES events. The independent comparison contains {independent.get('FS', 0)} FS and {independent.get('ES', 0)} ES participants. This is a fixed available sample; precision and detectable-effect simulations, not post-hoc observed power, will be used to discuss sufficiency.
+
+## Stopping rule
+The sample is the complete locked, analysis-ready dataset available at preregistration. No further participants or events will be added to the confirmatory analysis after inspecting results.
+
+## Variables and conditions
+The exposure labels are diagnostic group/event type (FS or ES), FS semiology (hypomotor or hypermotor), and time interval. The early interval is −20 to −10 minutes and the final interval is −1 to 0 minutes relative to genuine onset. DD participants contribute paired FS and ES observations.
+
+## Manipulated variables, randomization, and blinding
+There are no manipulated variables, randomized assignments, or experimental conditions. Group and event labels are observed clinical classifications. The analysis is not blinded because those labels are required to construct the pre-specified contrasts.
+
+## Measured variables
+The measured inputs are ordered microstate source/destination transitions, transition timestamps, CPI and CSI levels, CPI and CSI temporal gradients, diagnostic/event labels, FS semiology, participant, event, and time relative to onset.
+
+## Primary outcomes
+Four transformed outcomes are confirmatory: log ordinary transition-matrix JS divergence, log ordinary baseline-oriented κ, log autonomic-gradient-tensor JS divergence, and log autonomic-gradient-tensor κ. The tensor conditions are soft probabilities for increasing/decreasing CPI crossed with increasing/decreasing CSI at each genuine transition timestamp.
+
+## Indices and scale construction
+Ordinary JS measures divergence from the participant's interictal transition grammar. Ordinary κ measures sharpening or flattening along that baseline grammar. Tensor JS and κ apply the same definitions to four soft autonomic-gradient conditions: CPI↑/CSI↑, CPI↑/CSI↓, CPI↓/CSI↑, and CPI↓/CSI↓.
+
+## Data reduction and transformations
+Windows require at least 30 observed transitions. Event-level interval means are formed first, followed by participant-level means within the relevant diagnostic or semiology stratum. JS and κ are analysed on their pre-specified log scales. An exact-30-transition analysis is a sensitivity analysis, not a replacement for the primary estimates.
+
+## Exclusions and missing data
+Only windows supported by genuine transition timestamps and non-extrapolated autonomic interpolation are used. Both early and final intervals must be present for every primary estimand, including the final-minute contrast, so the analysis set is coverage-matched. No outcome-based exclusions or imputation will be used.
+
+## Statistical models
+Independent FS versus ES uses a two-sided Welch participant-level t test. FS hypomotor versus hypermotor uses OLS on participant-by-semiology means with participant-clustered, small-sample-corrected standard errors; the coefficient is hyper minus hypo. The locked FS semiology data contain {semi_events.get('hypo', 0)} hypomotor and {semi_events.get('hyper', 0)} hypermotor complete events from {semi_participants.get('hypo', 0)} and {semi_participants.get('hyper', 0)} participants respectively, with {summary['fs_participants_in_both_semiology_strata']} participants represented in both strata. The within-DD comparison uses a paired participant-level t test in {summary['paired_dd_complete_participants']} complete participants.
+
+## Multiplicity and decision rule
+There are 4 outcomes × 2 estimands × 3 contrasts = 24 planned two-sided tests. Holm correction controls the family-wise error rate across all 24 tests. Adjusted p<0.05 is the confirmatory threshold; estimates, confidence information, raw p-values, and adjusted p-values will all be reported.
+
+## Sensitivity analyses
+We will repeat outcome construction after equalising every eligible window to exactly 30 transitions. We will also describe complete temporal coverage and interpolation support. Sensitivity results will be labelled as such and will not alter the primary multiplicity family.
+
+## Exploratory analyses
+Entropy concentration, destination/source-specific transition effects, autonomic levels and trajectories, peri-ictal 2D manifold movement, and baseline tensor precision are exploratory/descriptive. No large route-by-time hypothesis-test family will be generated. Pseudo-onset analyses are not part of this confirmatory onset-specific claim.
+
+## Causal interpretation
+All analyses are associational. Temporal ordering and interpolation do not identify a causal effect of autonomic change on microstate transitions or the reverse. We will not use causal language.
+
+## Transparency and deviations
+The uploaded lock records SHA-256 hashes of the plan, code, runner, and frozen inputs. After registration, the confirmatory command will abort before testing if any hash differs. Any deviation will be documented, justified, time-stamped, and clearly separated from the preregistered analysis.
+
+## Software and reproducibility
+The supplied Python and PowerShell code is the executable specification. The confirmatory runner performs synthetic self-checks, verifies every registered hash, skips regeneration of frozen backfits, and emits a separate execution record containing the registration identifier and result-file hash.
+
+## Files to upload with the registration
+Upload `OSF_PREREGISTRATION_BLURBS.md`, `POST_REGISTRATION_RUNBOOK.md`, `PREREGISTRATION_LOCK.json`, `PREREGISTRATION_LOCK.sha256`, `tables/confirmatory_analysis_plan_WITHHELD.csv`, and the locked code copies in `code/`. Retain the full review package and its `SHA256SUMS.csv` as the audit bundle.
+"""
+
+
+def post_registration_runbook() -> str:
+    return r"""# Confirmatory runbook (use only after immutable OSF registration)
+
+1. Upload the files listed in `OSF_PREREGISTRATION_BLURBS.md`, complete the OSF form, and create an immutable registration rather than merely saving a draft.
+2. Copy the public registration URL or DOI. Do not rerun the descriptive/locking mode and do not edit the locked code or inputs.
+3. Open PowerShell and run exactly:
+
+```powershell
+Set-Location -LiteralPath 'C:\Users\Admin\PycharmProjects\FS_MS'
+.\run_timestamped_transition_pipeline.ps1 `
+  -RunConfirmatory `
+  -PreregistrationId 'https://osf.io/REPLACE_WITH_REGISTRATION_ID'
+```
+
+4. The command first runs synthetic self-checks and then verifies the SHA-256 sidecar, the 24-test plan, all locked code, and all frozen inputs. It skips MATLAB fitting/export so those frozen inputs cannot be silently regenerated. Any mismatch stops execution before confirmatory statistics.
+5. A successful run writes `tables/confirmatory_results.csv` and `CONFIRMATORY_EXECUTION.json` to `C:\Users\Admin\OneDrive - NHS\FS_MS\publication_timestamped_prereg`, and refreshes the adjacent review package. Confirm that `all_registered_hashes_verified_before_statistics` is `true` and archive both files without editing them.
+6. Report all 24 tests, their signed estimates and 95% confidence intervals, raw p-values, and Holm-adjusted p-values. Label exact-30, manifold, autonomic-state, source/destination, and entropy analyses as sensitivity or exploratory as preregistered.
+"""
+
+
+def write_preregistration_lock(output: Path, artifact_paths: dict[str, Path],
+                               plan_hash: str, summary: dict[str, object],
+                               prehashed: dict[str, str] | None = None,
+                               hash_provenance: str = "computed directly from files in this locked run") -> dict[str, object]:
+    prehashed = prehashed or {}
+    artifacts = {name: {"file_name": path.name,
+                        "sha256": prehashed[name] if name in prehashed else sha256(path)}
+                 for name, path in artifact_paths.items()}
+    lock = {
+        "schema": "fs-ms-preregistration-lock/v1",
+        "status": "LOCKED_PENDING_PREREGISTRATION",
+        "locked_utc": datetime.now(timezone.utc).isoformat(),
+        "hash_algorithm": "SHA-256",
+        "confirmatory_statistics_run": False,
+        "unlock_condition": "immutable OSF registration plus --run-confirmatory and its public registration identifier",
+        "planned_test_count": 24,
+        "route_level_test_count": 0,
+        "locked_plan_sha256": plan_hash,
+        "hash_provenance": hash_provenance,
+        "prehashed_artifact_roles": sorted(prehashed),
+        "sample_summary": summary,
+        "artifacts": artifacts,
+    }
+    lock_path = output / "PREREGISTRATION_LOCK.json"
+    write_text_exact(lock_path, json.dumps(lock, indent=2, sort_keys=True) + "\n")
+    write_text_exact(output / "PREREGISTRATION_LOCK.sha256",
+                     f"{sha256(lock_path)}  PREREGISTRATION_LOCK.json\n")
+    return lock
+
+
+def refresh_lock_from_existing(args: argparse.Namespace) -> None:
+    """Refresh only preregistration documents; never calculate inferential statistics."""
+    output, tables = args.out_dir, args.out_dir / "tables"
+    metrics_path = tables / "timestamped_window_metrics.csv.gz"
+    audit_path = output / "ANALYSIS_AUDIT.json"
+    if not metrics_path.exists() or not audit_path.exists():
+        raise RuntimeError("Existing locked metrics and ANALYSIS_AUDIT.json are required")
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    if audit.get("confirmatory_statistics_run") is not False:
+        raise RuntimeError("Existing audit is not a no-statistics run")
+    repo = Path(__file__).resolve().parent
+    scripts = [Path(__file__).resolve(), repo / "recover_timestamped_transition_backfits.m",
+               repo / "run_timestamped_transition_pipeline.ps1",
+               repo / "external/VG-microstates/fit_microstate_hierarchical_dataset.m",
+               repo / "external/VG-microstates/_internal/matlab/backfit_microstate_timecourse.m"]
+    plan = confirmatory_plan()
+    plan_text = plan.to_csv(index=False, lineterminator="\n")
+    plan_hash = sha256_text(plan_text)
+    summary = sample_summary(pd.read_csv(metrics_path))
+    write_text_exact(tables / "confirmatory_analysis_plan_WITHHELD.csv", plan_text)
+    write_text_exact(output / "OSF_PREREGISTRATION_BLURBS.md", osf_preregistration_blurbs(summary))
+    write_text_exact(output / "POST_REGISTRATION_RUNBOOK.md", post_registration_runbook())
+    recovery_audit_path = args.transition_index.parent / "recovery_audit.json"
+    artifact_paths = {
+        "analysis_plan": tables / "confirmatory_analysis_plan_WITHHELD.csv",
+        "osf_preregistration_blurbs": output / "OSF_PREREGISTRATION_BLURBS.md",
+        "post_registration_runbook": output / "POST_REGISTRATION_RUNBOOK.md",
+        "analysis_python": scripts[0], "backfit_exporter_matlab": scripts[1],
+        "timestamped_runner_powershell": scripts[2], "hierarchy_fit_matlab": scripts[3],
+        "backfit_function_matlab": scripts[4], "transition_index": args.transition_index,
+        "backfit_recovery_audit": recovery_audit_path, "autonomic_native_input": args.autonomic_native,
+        "manifest_input": args.manifest,
+    }
+    prior_inputs = {normalise_path(path): value for path, value in audit.get("inputs", {}).items()}
+    input_roles = ("transition_index", "backfit_recovery_audit", "autonomic_native_input", "manifest_input")
+    prehashed = {}
+    for role in input_roles:
+        key = normalise_path(str(artifact_paths[role]))
+        if key not in prior_inputs:
+            raise RuntimeError(f"Prior audited hash is missing for {artifact_paths[role]}")
+        prehashed[role] = prior_inputs[key]
+    write_preregistration_lock(
+        output, artifact_paths, plan_hash, summary, prehashed=prehashed,
+        hash_provenance=("frozen input hashes carried forward from the existing no-statistics ANALYSIS_AUDIT.json "
+                         f"({audit.get('completed_utc')}); every file will be re-hashed before inference"))
+    if args.review_dir:
+        update_review(output, args.review_dir, scripts)
+    print(json.dumps({"preregistration_lock_refreshed": True, "confirmatory_statistics_run": False,
+                      "prehashed_artifact_roles": sorted(prehashed)}, indent=2))
+
+
+def verify_preregistration_lock(output: Path, artifact_paths: dict[str, Path],
+                                expected_plan_hash: str) -> tuple[dict[str, object], str]:
+    lock_path = output / "PREREGISTRATION_LOCK.json"
+    sidecar = output / "PREREGISTRATION_LOCK.sha256"
+    if not lock_path.exists() or not sidecar.exists():
+        raise RuntimeError("Missing preregistration lock or SHA-256 sidecar; run the locked descriptive pipeline first")
+    lock_hash = sha256(lock_path)
+    sidecar_hash = sidecar.read_text(encoding="utf-8").strip().split()[0].lower()
+    if sidecar_hash != lock_hash:
+        raise RuntimeError("PREREGISTRATION_LOCK.sha256 does not match PREREGISTRATION_LOCK.json")
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    if lock.get("schema") != "fs-ms-preregistration-lock/v1" or lock.get("status") != "LOCKED_PENDING_PREREGISTRATION":
+        raise RuntimeError("Preregistration lock schema or status is invalid")
+    if lock.get("confirmatory_statistics_run") is not False:
+        raise RuntimeError("Preregistration lock indicates that confirmatory statistics were already run")
+    if lock.get("planned_test_count") != 24 or lock.get("locked_plan_sha256") != expected_plan_hash:
+        raise RuntimeError("Current confirmatory plan does not match the preregistered plan")
+    locked_artifacts = lock.get("artifacts", {})
+    if set(locked_artifacts) != set(artifact_paths):
+        raise RuntimeError("Locked artifact set does not match the current pipeline artifact set")
+    mismatches = []
+    for name, path in artifact_paths.items():
+        if not path.exists() or sha256(path) != locked_artifacts[name].get("sha256"):
+            mismatches.append(name)
+    if mismatches:
+        raise RuntimeError("Preregistration hash mismatch: " + ", ".join(mismatches))
+    return lock, lock_hash
+
+
 def update_review(output: Path, review: Path, scripts: list[Path]) -> None:
     review.mkdir(parents=True, exist_ok=True)
     shutil.copytree(output / "figures", review / "figures", dirs_exist_ok=True)
     (review / "tables").mkdir(exist_ok=True)
+    stale_result = review / "tables" / "confirmatory_results.csv"
+    if not (output / "tables" / "confirmatory_results.csv").exists() and stale_result.exists():
+        stale_result.unlink()
     for source in (output / "tables").iterdir():
         if source.name not in {"timestamped_window_matrices.npz", "timestamped_window_metadata.csv.gz"}:
             shutil.copy2(source, review / "tables" / source.name)
     (review / "code").mkdir(exist_ok=True)
     for script in scripts:
         shutil.copy2(script, review / "code" / script.name)
-    for name in ("README.md", "ANALYSIS_AUDIT.json", "BACKFIT_RECOVERY_AUDIT.json", "PREREGISTRATION_LOCK.json"):
-        shutil.copy2(output / name, review / name)
+    root_files = ("README.md", "ANALYSIS_AUDIT.json", "BACKFIT_RECOVERY_AUDIT.json",
+                  "OSF_PREREGISTRATION_BLURBS.md", "POST_REGISTRATION_RUNBOOK.md", "PREREGISTRATION_LOCK.json",
+                  "PREREGISTRATION_LOCK.sha256", "CONFIRMATORY_EXECUTION.json")
+    for name in root_files:
+        source = output / name
+        destination = review / name
+        if source.exists():
+            shutil.copy2(source, destination)
+        elif destination.exists():
+            destination.unlink()
     with (review / "README.md").open("a", encoding="utf-8") as stream:
         stream.write("\n## Review package note\n\nThe large per-transition NPZ caches and full window-matrix NPZ are not duplicated here; their indexed locations and all analysis-ready metric tables are included.\n")
     files = [path for path in review.rglob("*") if path.is_file() and path.name != "SHA256SUMS.csv"]
@@ -703,6 +1017,39 @@ def self_check() -> None:
     baseline_tensor = np.broadcast_to(dense / 4, (1, 4, 6, 6)).copy()
     assert "P" in participant_baselines(baseline_metadata, dense[None], baseline_tensor, 10)[0]
     assert len(confirmatory_plan()) == 24
+    synthetic = pd.DataFrame({
+        "participant": ["P1", "P1", "P2", "P3", "P4", "P4"],
+        "semiology": ["hypo", "hyper", "hypo", "hyper", "hypo", "hyper"],
+        "value": [1., 2., 1.2, 2.2, .8, 1.8],
+    })
+    clustered = clustered_hypo_hyper(synthetic)
+    assert np.isclose(clustered["estimate"], 1) and clustered["n_clusters"] == 4
+    assert clustered["n_overlap"] == 2 and np.isfinite(clustered["p"])
+    event_design = [
+        ("F1", "FS", "FS", "hypo", 1.), ("F1", "FS", "FS", "hyper", 1.2),
+        ("F2", "FS", "FS", "hypo", 1.1), ("F3", "FS", "FS", "hyper", 1.3),
+        ("E1", "ES", "ES", np.nan, .7), ("E2", "ES", "ES", np.nan, .8),
+        ("E3", "ES", "ES", np.nan, .9),
+        ("D1", "DD", "FS", "hypo", 1.), ("D1", "DD", "ES", np.nan, .8),
+        ("D2", "DD", "FS", "hyper", 1.2), ("D2", "DD", "ES", np.nan, .9),
+        ("D3", "DD", "FS", "hypo", 1.1), ("D3", "DD", "ES", np.nan, .85),
+    ]
+    confirmatory_rows = []
+    for number, (participant, group, event_type, semiology, value) in enumerate(event_design):
+        for time_bin, offset in ((TIME_BINS[0], 0.), (TIME_BINS[-1], .05 + .01 * (number % 4))):
+            row = {"participant": participant, "event_key": f"E{number}", "group": group,
+                   "event_type": event_type, "semiology": semiology,
+                   "condition": "preict", "time_bin": time_bin}
+            row.update({outcome: value + offset for outcome in
+                        ("log_ordinary_js", "log_ordinary_kappa", "log_tensor_js", "log_tensor_kappa")})
+            confirmatory_rows.append(row)
+    synthetic_result = run_confirmatory(pd.DataFrame(confirmatory_rows), "synthetic-preregistration")
+    assert len(synthetic_result) == 24
+    synthetic_primary = synthetic_result[
+        synthetic_result.outcome.eq("log_ordinary_js") & synthetic_result.estimand.eq("final_minute")]
+    assert synthetic_primary.loc[synthetic_primary.contrast.eq("FS versus ES"), "n_first"].iat[0] == 3
+    assert synthetic_primary.loc[synthetic_primary.contrast.eq("FS hypo versus hyper"), "n_overlap"].iat[0] == 1
+    assert synthetic_primary.loc[synthetic_primary.contrast.eq("within-DD FS versus ES"), "n_first"].iat[0] == 3
     print("timestamped transition self-check passed")
 
 
@@ -716,10 +1063,19 @@ def main() -> None:
     parser.add_argument("--prior-strength", type=float, default=10)
     parser.add_argument("--run-confirmatory", action="store_true")
     parser.add_argument("--preregistration-id", default="")
+    parser.add_argument("--refresh-preregistration-lock", action="store_true")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     if args.self_check:
         self_check(); return
+    if args.refresh_preregistration_lock:
+        if args.run_confirmatory:
+            parser.error("--refresh-preregistration-lock cannot be combined with --run-confirmatory")
+        try:
+            refresh_lock_from_existing(args)
+        except RuntimeError as error:
+            parser.error(str(error))
+        return
     if args.run_confirmatory and not args.preregistration_id.strip():
         parser.error("--run-confirmatory requires --preregistration-id after preregistration")
     for path in (args.transition_index, args.autonomic_native, args.manifest):
@@ -733,7 +1089,37 @@ def main() -> None:
         parser.error("Backfit recovery did not pass both exact validation gates")
 
     output, tables, figures = args.out_dir, args.out_dir / "tables", args.out_dir / "figures"
+    repo = Path(__file__).resolve().parent
+    scripts = [Path(__file__).resolve(), repo / "recover_timestamped_transition_backfits.m",
+               repo / "run_timestamped_transition_pipeline.ps1",
+               repo / "external/VG-microstates/fit_microstate_hierarchical_dataset.m",
+               repo / "external/VG-microstates/_internal/matlab/backfit_microstate_timecourse.m"]
+    plan = confirmatory_plan()
+    plan_text = plan.to_csv(index=False, lineterminator="\n")
+    plan_hash = sha256_text(plan_text)
+    artifact_paths = {
+        "analysis_plan": tables / "confirmatory_analysis_plan_WITHHELD.csv",
+        "osf_preregistration_blurbs": output / "OSF_PREREGISTRATION_BLURBS.md",
+        "post_registration_runbook": output / "POST_REGISTRATION_RUNBOOK.md",
+        "analysis_python": scripts[0], "backfit_exporter_matlab": scripts[1],
+        "timestamped_runner_powershell": scripts[2], "hierarchy_fit_matlab": scripts[3],
+        "backfit_function_matlab": scripts[4], "transition_index": args.transition_index,
+        "backfit_recovery_audit": recovery_audit_path, "autonomic_native_input": args.autonomic_native,
+        "manifest_input": args.manifest,
+    }
+    registered_lock = None
+    registered_lock_hash = None
+    if args.run_confirmatory:
+        try:
+            registered_lock, registered_lock_hash = verify_preregistration_lock(output, artifact_paths, plan_hash)
+        except RuntimeError as error:
+            parser.error(str(error))
+
     tables.mkdir(parents=True, exist_ok=True); figures.mkdir(exist_ok=True)
+    if not args.run_confirmatory:
+        for stale in (tables / "confirmatory_results.csv", output / "CONFIRMATORY_EXECUTION.json"):
+            if stale.exists():
+                stale.unlink()
     shutil.copy2(recovery_audit_path, output / "BACKFIT_RECOVERY_AUDIT.json")
     index = pd.read_csv(args.transition_index)
     index["file_key"] = normalise_path(index.file_path)
@@ -773,26 +1159,33 @@ def main() -> None:
     precision_summary.to_csv(tables / "baseline_B_tensor_precision_summary.csv", index=False)
     scores.to_csv(tables / "peri_ictal_manifold_scores.csv.gz", index=False, compression="gzip")
     loadings.to_csv(tables / "peri_ictal_manifold_loadings.csv", index=False)
-    plan = confirmatory_plan(); plan.to_csv(tables / "confirmatory_analysis_plan_WITHHELD.csv", index=False)
-    lock = {
-        "confirmatory_statistics_run": bool(args.run_confirmatory),
-        "locked_plan_sha256": sha256(tables / "confirmatory_analysis_plan_WITHHELD.csv"),
-        "unlock_condition": "supply both --run-confirmatory and a non-empty --preregistration-id",
-        "planned_test_count": len(plan), "route_level_test_count": 0,
-    }
-    (output / "PREREGISTRATION_LOCK.json").write_text(json.dumps(lock, indent=2), encoding="utf-8")
+    summary = sample_summary(metrics)
+    if not args.run_confirmatory:
+        write_text_exact(tables / "confirmatory_analysis_plan_WITHHELD.csv", plan_text)
+        write_text_exact(output / "OSF_PREREGISTRATION_BLURBS.md", osf_preregistration_blurbs(summary))
+        write_text_exact(output / "POST_REGISTRATION_RUNBOOK.md", post_registration_runbook())
+        registered_lock = write_preregistration_lock(output, artifact_paths, plan_hash, summary)
+        registered_lock_hash = sha256(output / "PREREGISTRATION_LOCK.json")
     if args.run_confirmatory:
-        run_confirmatory(metrics, args.preregistration_id.strip()).to_csv(tables / "confirmatory_results.csv", index=False)
+        result_path = tables / "confirmatory_results.csv"
+        run_confirmatory(metrics, args.preregistration_id.strip()).to_csv(result_path, index=False)
+        execution = {
+            "schema": "fs-ms-confirmatory-execution/v1", "status": "EXECUTED_AFTER_PREREGISTRATION",
+            "executed_utc": datetime.now(timezone.utc).isoformat(),
+            "preregistration_id": args.preregistration_id.strip(),
+            "registered_lock_sha256": registered_lock_hash,
+            "registered_plan_sha256": registered_lock["locked_plan_sha256"],
+            "all_registered_hashes_verified_before_statistics": True,
+            "confirmatory_results_sha256": sha256(result_path),
+            "verified_artifacts": registered_lock["artifacts"],
+        }
+        write_text_exact(output / "CONFIRMATORY_EXECUTION.json",
+                         json.dumps(execution, indent=2, sort_keys=True) + "\n")
 
     plot_manifold(scores, figures)
     plot_matrix_trajectories(metrics, figures)
     plot_baseline_precision(precision, figures)
     plot_autonomic_state_trajectories(metrics, figures)
-    repo = Path(__file__).resolve().parent
-    scripts = [Path(__file__).resolve(), repo / "recover_timestamped_transition_backfits.m",
-               repo / "run_timestamped_transition_pipeline.ps1",
-               repo / "external/VG-microstates/fit_microstate_hierarchical_dataset.m",
-               repo / "external/VG-microstates/_internal/matlab/backfit_microstate_timecourse.m"]
     audit = {
         "completed_utc": datetime.now(timezone.utc).isoformat(),
         "input_resolution": "genuine ordered microstate-change samples at 1/256 s with heartbeat-resolved autonomic interpolation",
@@ -806,6 +1199,10 @@ def main() -> None:
         "route_level_hypothesis_tests": 0,
         "confirmatory_statistics_run": bool(args.run_confirmatory),
         "preregistration_id": args.preregistration_id.strip() if args.run_confirmatory else None,
+        "preregistration_lock_sha256": registered_lock_hash,
+        "registered_plan_sha256": registered_lock["locked_plan_sha256"],
+        "preregistration_hashes_verified_before_statistics": bool(args.run_confirmatory),
+        "hypo_hyper_test": "participant-clustered OLS on participant-by-semiology means",
         "n_transition_records": len(index), "n_exact_transitions": int(action_index.n_transitions.sum()),
         "n_transitions_with_interpolated_action": int(action_index.n_with_interpolated_action.sum()),
         "interpolated_action_fraction": float(action_index.n_with_interpolated_action.sum() / action_index.n_transitions.sum()),
@@ -814,7 +1211,7 @@ def main() -> None:
         "inputs": {str(path): sha256(path) for path in
                    (args.transition_index, recovery_audit_path, args.autonomic_native, args.manifest)},
     }
-    (output / "ANALYSIS_AUDIT.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    write_text_exact(output / "ANALYSIS_AUDIT.json", json.dumps(audit, indent=2) + "\n")
     (output / "README.md").write_text(
         "# Timestamped transition analysis\n\n"
         "This run uses every genuine ordered microstate transition at EEG-sample resolution and linearly "
@@ -828,7 +1225,9 @@ def main() -> None:
         "- `tables/peri_ictal_manifold_scores.csv.gz`: event-by-period 2D movement coordinates.\n"
         "- `transition_action_cache/*.npz`: every genuine transition sample, canonical source/destination, CPI/CSI levels, gradients, descriptive state weights and gradient-tensor weights.\n"
         "- `tables/transition_action_cache_index.csv`: links those caches to source records.\n"
-        "- `PREREGISTRATION_LOCK.json`: execution status and the hash of the locked test plan.\n\n"
+        "- `OSF_PREREGISTRATION_BLURBS.md`: concise, paste-ready text for the OSF form.\n"
+        "- `POST_REGISTRATION_RUNBOOK.md`: exact hash-gated command to use after registration.\n"
+        "- `PREREGISTRATION_LOCK.json` and `.sha256`: immutable plan/code/input hashes checked before inference.\n\n"
         + ("Confirmatory tests were run under preregistration `" + args.preregistration_id + "`.\n" if args.run_confirmatory else
            "**Confirmatory FS–ES, FS hypo–hyper, and paired within-DD tests are intentionally withheld pending preregistration.**\n"),
         encoding="utf-8")
