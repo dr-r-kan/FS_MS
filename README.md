@@ -3,6 +3,11 @@
 Does the change in autonomic-gradient-conditioned EEG microstate transition organisation approaching seizure
 onset differ between functional-seizure-only (FS) and epileptic-seizure-only (ES) participants?
 
+**Background.** The work is predicated on an Active Inference account of dissociative symptoms. HEPPy preprocesses
+the EEG/ECG, variational Bayesian (GMM) microstates are fitted, and the analysis then looks at the "out of C" flow
+between microstates: how far the transition distribution has drifted from the participant's interictal baseline, and
+how precise (concentrated) it is.
+
 This repository runs the whole analysis from raw EDF clips to the registered confirmatory tests:
 
 ```
