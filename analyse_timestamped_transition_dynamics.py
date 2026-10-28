@@ -16,6 +16,9 @@ import json
 import math
 from pathlib import Path
 import shutil
+import platform
+import importlib.metadata
+from urllib.parse import urlparse
 
 import h5py
 import matplotlib
@@ -23,21 +26,54 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.optimize import brentq
 from scipy.io import loadmat
 from scipy.special import expit
-from scipy.stats import beta, t as student_t, ttest_ind, ttest_rel
+from scipy.stats import beta, permutation_test, t as student_t, trim_mean, ttest_ind, ttest_rel
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import statsmodels.api as sm
+from statsmodels.stats.multitest import multipletests
 
 
 STATES = ("F", "E", "G", "B", "A", "C")
-FIT_LABELS = ("A", "F", "C", "G", "B", "E")
-FIT_TO_CANONICAL = np.array([STATES.index(label) for label in FIT_LABELS])
+
+def fit_to_canonical(fit_labels) -> np.ndarray:
+    """Map fitted-state index (1..6 in the MATLAB fit) to the canonical STATES order.
+
+    The labels are DERIVED by the pre-specified template rule and recorded in recovery_audit.json
+    (``fit_labels``); no analyst-chosen order is baked into this file.
+    """
+    labels = tuple(str(label).strip().upper() for label in fit_labels)
+    if len(labels) != 6 or sorted(labels) != sorted(STATES):
+        raise ValueError(f"fit_labels must be a permutation of {sorted(STATES)}, got {list(labels)}")
+    return np.array([STATES.index(label) for label in labels])
+
+
 ACTIONS = ("dCPI+/dCSI+", "dCPI+/dCSI-", "dCPI-/dCSI+", "dCPI-/dCSI-")
 STATE_ACTIONS = ("CPI+/CSI+", "CPI+/CSI-", "CPI-/CSI+", "CPI-/CSI-")
 TIME_BINS = ("-20 to -10", "-10 to -5", "-5 to -2", "-2 to -1", "-1 to 0")
 TIME_MIDPOINT = dict(zip(TIME_BINS, (-15, -7.5, -3.5, -1.5, -.5)))
+MAX_AUTONOMIC_GAP_S = 5.0
+PRIOR_STRENGTH = 10.0
+# Outcomes: JS enters inference as the NULL-CALIBRATED EXCESS (JS - E0); kappa as log kappa.  Log JS is retained
+# as a descriptive column only (it depends on window transition count and soft-weight sharpness).
+OUTCOMES = ("ordinary_js_excess", "log_ordinary_kappa", "tensor_js_excess", "log_tensor_kappa")
+PRIMARY_OUTCOMES = ("tensor_js_excess", "log_tensor_kappa")
+SECONDARY_FS_ES_OUTCOMES = ("ordinary_js_excess", "log_ordinary_kappa")
+NULL_DRAWS = 400                 # parametric-bootstrap draws per window for E0
+MIN_WINDOW_TRANSITIONS = 30      # per 60-s window (ordinary, and action-supported for the tensor)
+MIN_REFERENCE_TRANSITIONS = 300  # interictal reference length (after leaving the evaluated window out)
+MIN_EARLY_WINDOWS = 5            # eligible early windows per event
+TRIM = 0.2                       # Yuen sensitivity trimming proportion
+PERMUTATIONS = 20000             # studentised permutation sensitivity
+MIN_DD_PAIRS = 3
+MIN_CLUSTERS_PER_SEMIOLOGY = 3
+ANALYSIS_SETTINGS = {"prior_strength": 10.0, "max_autonomic_gap_s": 5.0, "null_draws": NULL_DRAWS,
+                     "min_window_transitions": MIN_WINDOW_TRANSITIONS,
+                     "min_reference_transitions": MIN_REFERENCE_TRANSITIONS,
+                     "min_early_windows": MIN_EARLY_WINDOWS, "trim": TRIM, "permutations": PERMUTATIONS,
+                     "min_dd_pairs": MIN_DD_PAIRS, "min_clusters_per_semiology": MIN_CLUSTERS_PER_SEMIOLOGY}
 OFF_DIAGONAL = ~np.eye(6, dtype=bool)
 FS_COLOR, ES_COLOR = "#0072B2", "#D55E00"
 HYPO_COLOR, HYPER_COLOR = "#6A3D9A", "#009E73"
@@ -131,7 +167,8 @@ def gradient_weights(cpi_gradient: np.ndarray, csi_gradient: np.ndarray) -> np.n
         scale = np.nanmedian(np.abs(values[valid])) if valid.any() else np.nan
         if not np.isfinite(scale) or scale <= 1e-12:
             scale = np.nanstd(values[valid]) if valid.any() else np.nan
-        normalised.append(values / scale if np.isfinite(scale) and scale > 1e-12 else np.zeros_like(values))
+        normalised.append(values / scale if np.isfinite(scale) and scale > 1e-12
+                          else np.where(valid, 0.0, np.nan))
     return action_weights(normalised[0], normalised[1])
 
 
@@ -195,7 +232,7 @@ def fit_kappa(counts: np.ndarray, reference: np.ndarray) -> float:
     effect = np.log(np.clip(probabilities[..., OFF_DIAGONAL].reshape(-1, 5), 1e-12, 1))
     n = x.sum(axis=1)
     valid = n > 0
-    if not valid.any():
+    if not valid.any() or np.all(np.ptp(effect[valid], axis=1) < 1e-12):
         return np.nan
     x, effect, n = x[valid], effect[valid], n[valid]
 
@@ -210,21 +247,12 @@ def fit_kappa(counts: np.ndarray, reference: np.ndarray) -> float:
         hessian = float(-np.sum(n * variance))
         return likelihood, gradient, hessian
 
-    kappa = 1.0
-    for _ in range(30):
-        likelihood, gradient, hessian = objective(kappa)
-        if hessian >= -1e-10:
-            break
-        step = -gradient / hessian
-        if abs(step) < 1e-7:
-            break
-        candidate = float(np.clip(kappa + step, math.exp(-4), math.exp(4)))
-        for _ in range(10):
-            if objective(candidate)[0] >= likelihood:
-                break
-            step *= .5; candidate = float(np.clip(kappa + step, math.exp(-4), math.exp(4)))
-        kappa = candidate
-    return float(kappa)
+    lower, upper = math.exp(-4), math.exp(4)
+    if objective(lower)[1] <= 0:
+        return lower
+    if objective(upper)[1] >= 0:
+        return upper
+    return float(brentq(lambda k: objective(k)[1], lower, upper, xtol=1e-8))
 
 
 def entropy_concentration(counts: np.ndarray) -> float:
@@ -244,26 +272,79 @@ def entropy_concentration(counts: np.ndarray) -> float:
     return float(np.average(rows, weights=weights)) if rows else np.nan
 
 
-def stable_sample(size: int, number: int, key: str) -> np.ndarray:
-    if size < number:
-        return np.array([], dtype=int)
-    seed = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "little")
-    return np.random.default_rng(seed).choice(size, number, replace=False)
+def stable_rng(key: str) -> np.random.Generator:
+    """Deterministic generator keyed by a string (recording, window, purpose): reruns are bit-identical."""
+    return np.random.default_rng(int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "little"))
+
+
+def weighted_js_batch(counts: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """``weighted_js`` for a stack of count tensors (B, A, 6, 6) against one reference (A, 6, 6); returns (B,)."""
+    x = np.asarray(counts, float)[..., OFF_DIAGONAL].reshape(len(counts), -1, 5)
+    q = np.asarray(reference, float)[..., OFF_DIAGONAL].reshape(-1, 5)
+    n = x.sum(axis=2)
+    p = (x + .5) / (n[..., None] + 2.5)
+    q = np.clip(q, 1e-12, None); q /= q.sum(axis=1, keepdims=True)
+    midpoint = (p + q) / 2
+    js = .5 * np.sum(p * np.log(p / midpoint), axis=2) + .5 * np.sum(q * np.log(q / midpoint), axis=2)
+    total = n.sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(total > 0, (js * n).sum(axis=1) / total, np.nan)
+
+
+def null_expected_js(source: np.ndarray, weights: np.ndarray, reference: np.ndarray, key: str,
+                     draws: int = NULL_DRAWS) -> float:
+    """E0: expected weighted JS if this window's destinations were drawn from the reference.
+
+    Plug-in JS is positively biased by an amount that depends on the window's transition count, its source
+    mix and the sharpness of the soft action weights - all of which can differ between intervals or groups for
+    reasons unrelated to grammar.  Conditional on the window's OWN source sequence and soft weights
+    (``weights``: n x A, rows sum to 1; the ordinary matrix is A=1 with weight 1), destinations are drawn from
+    sum_a w_ia * reference[a, s_i, :] with a hash-seeded generator and the same soft-count JS is computed for each
+    draw.  ``JS - E0`` is the calibrated outcome used for inference.
+    """
+    source = np.asarray(source, int)
+    weights = np.asarray(weights, float)
+    n_actions = weights.shape[1]
+    reference = np.asarray(reference, float).reshape(n_actions, 6, 6)
+    if len(source) == 0:
+        return np.nan
+    rows = np.einsum("ia,aid->id", weights, reference[:, source, :])
+    rows /= rows.sum(axis=1, keepdims=True)
+    cdf = np.cumsum(rows, axis=1)
+    cdf[:, -1] = 1.0
+    uniform = stable_rng(key).random((draws, len(source)))
+    destination = (uniform[:, :, None] >= cdf[None, :, :5]).sum(axis=2)
+    flat = (source[None, :] * 6 + destination + np.arange(draws)[:, None] * 36).ravel()
+    counts = np.empty((draws, n_actions, 6, 6))
+    for action in range(n_actions):
+        counts[:, action] = np.bincount(flat, weights=np.tile(weights[:, action], draws),
+                                        minlength=draws * 36).reshape(draws, 6, 6)
+    return float(np.nanmean(weighted_js_batch(counts, reference)))
 
 
 def interpolate_native(native: pd.DataFrame, times: np.ndarray) -> tuple[np.ndarray, ...]:
-    if native.empty:
-        missing = np.full(len(times), np.nan)
-        return missing.copy(), missing.copy(), missing.copy(), missing
+    """Interpolate inside contiguous finite runs; never bridge missing rows or long gaps."""
     levels, gradients = [], []
     for column in ("csi_z", "cpi_z"):
-        subset = native[["event_time_s", column]].apply(pd.to_numeric, errors="coerce").dropna()
-        subset = subset.groupby("event_time_s", as_index=False)[column].mean().sort_values("event_time_s")
-        if len(subset) < 2:
-            levels.append(np.full(len(times), np.nan)); gradients.append(np.full(len(times), np.nan)); continue
-        x, y = subset.event_time_s.to_numpy(), subset[column].to_numpy()
-        levels.append(np.interp(times, x, y, left=np.nan, right=np.nan))
-        gradients.append(np.interp(times, x, np.gradient(y, x), left=np.nan, right=np.nan))
+        level = np.full(len(times), np.nan); gradient = level.copy()
+        if not native.empty:
+            subset = native[["event_time_s", column]].apply(pd.to_numeric, errors="coerce")
+            subset = subset.dropna(subset=["event_time_s"]).groupby(
+                "event_time_s", as_index=False)[column].mean().sort_values("event_time_s")
+            x, y = subset.event_time_s.to_numpy(), subset[column].to_numpy()
+            good = np.isfinite(x) & np.isfinite(y)
+            starts = np.flatnonzero(good & np.r_[True, ~good[:-1] | (np.diff(x) > MAX_AUTONOMIC_GAP_S)])
+            for start in starts:
+                stop = start + 1
+                while stop < len(x) and good[stop] and x[stop] - x[stop-1] <= MAX_AUTONOMIC_GAP_S:
+                    stop += 1
+                if stop - start < 2:
+                    continue
+                xx, yy = x[start:stop], y[start:stop]
+                use = (times >= xx[0]) & (times <= xx[-1])
+                level[use] = np.interp(times[use], xx, yy)
+                gradient[use] = np.interp(times[use], xx, np.gradient(yy, xx))
+        levels.append(level); gradients.append(gradient)
     return levels[0], levels[1], gradients[0], gradients[1]
 
 
@@ -295,15 +376,26 @@ def load_native(path: Path, file_keys: set[str]) -> dict[str, pd.DataFrame]:
     return {key: value for key, value in frame.groupby("file_key", sort=False)}
 
 
-def build_windows(index: pd.DataFrame, native: dict[str, pd.DataFrame], action_cache: Path
-                  ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
-    metadata, ordinary, tensor, ordinary30, tensor30, action_rows = [], [], [], [], [], []
+def build_windows(index: pd.DataFrame, native: dict[str, pd.DataFrame], action_cache: Path,
+                  fit_labels
+                  ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame]:
+    metadata, ordinary, tensor, action_rows = [], [], [], []
+    fit_map = fit_to_canonical(fit_labels)
     action_cache.mkdir(parents=True, exist_ok=True)
     for record_number, row in enumerate(index.itertuples(index=False), 1):
         transition = load_transition_cache(Path(row.cache_file))
+        samples = transition["sample"]
+        if (not np.isfinite(transition["sfreq"]) or transition["sfreq"] <= 0
+                or transition["n_samples"] < 1 or len(samples) != len(transition["from"])
+                or len(samples) != len(transition["to"]) or np.any(np.diff(samples) <= 0)
+                or np.any(samples < 1) or np.any(samples > transition["n_samples"])
+                or not np.isin(transition["from"], np.arange(1, 7)).all()
+                or not np.isin(transition["to"], np.arange(1, 7)).all()
+                or np.any(transition["from"] == transition["to"])):
+            raise ValueError("Invalid ordered genuine-transition cache")
         times = (transition["sample"] - 1) / transition["sfreq"]
-        source = FIT_TO_CANONICAL[transition["from"] - 1]
-        destination = FIT_TO_CANONICAL[transition["to"] - 1]
+        source = fit_map[transition["from"] - 1]
+        destination = fit_map[transition["to"] - 1]
         csi, cpi, csi_gradient, cpi_gradient = interpolate_native(
             native.get(row.file_key, pd.DataFrame()), times)
         state_action = action_weights(cpi, csi)
@@ -330,19 +422,12 @@ def build_windows(index: pd.DataFrame, native: dict[str, pd.DataFrame], action_c
         for start in window_starts(row.condition, duration):
             stop = start + 60
             left, right = np.searchsorted(times, (start, stop), side="left")
-            if right - left < 30:
+            if right - left < MIN_WINDOW_TRANSITIONS:
                 continue
             sl = slice(left, right)
             counts = transition_counts(source[sl], destination[sl])
             weighted = tensor_counts(source[sl], destination[sl], action[sl])
             valid_action = np.isfinite(action[sl]).all(axis=1)
-            sample = stable_sample(right - left, 30, f"{row.file_key}|{start:.9f}|ordinary")
-            valid_positions = np.flatnonzero(valid_action)
-            sample_action_local = stable_sample(len(valid_positions), 30, f"{row.file_key}|{start:.9f}|tensor")
-            sample_action = valid_positions[sample_action_local] if len(sample_action_local) else np.array([], dtype=int)
-            c30 = transition_counts(source[sl][sample], destination[sl][sample])
-            t30 = (tensor_counts(source[sl][sample_action], destination[sl][sample_action], action[sl][sample_action])
-                   if len(sample_action) else np.full((4, 6, 6), np.nan))
             endpoint = duration - stop if row.condition == "preict" else np.nan
             metadata.append({
                 "row_id": len(metadata), "participant": row.participant, "file_path": row.file_path,
@@ -351,6 +436,7 @@ def build_windows(index: pd.DataFrame, native: dict[str, pd.DataFrame], action_c
                 "window_start_s": start, "window_end_s": stop, "window_end_to_ictus_s": endpoint,
                 "time_bin": time_bin(endpoint) if row.condition == "preict" else "II",
                 "n_transitions": right - left, "n_action_transitions": int(valid_action.sum()),
+                "action_cache": str(action_file), "window_left": int(left), "window_right": int(right),
                 "csi_transition_mean": np.nanmean(csi[sl]) if np.isfinite(csi[sl]).any() else np.nan,
                 "cpi_transition_mean": np.nanmean(cpi[sl]) if np.isfinite(cpi[sl]).any() else np.nan,
                 "csi_gradient_mean_z_per_s": np.nanmean(csi_gradient[sl]) if np.isfinite(csi_gradient[sl]).any() else np.nan,
@@ -359,11 +445,12 @@ def build_windows(index: pd.DataFrame, native: dict[str, pd.DataFrame], action_c
                    np.nanmean(state_action[sl, number]) if np.isfinite(state_action[sl, number]).any() else np.nan
                    for number, name in enumerate(STATE_ACTIONS)},
             })
-            ordinary.append(counts); tensor.append(weighted); ordinary30.append(c30); tensor30.append(t30)
+            ordinary.append(counts); tensor.append(weighted)
         if record_number % 25 == 0 or record_number == len(index):
             print(f"[{record_number}/{len(index)}] timestamped records windowed", flush=True)
-    return (pd.DataFrame(metadata), np.stack(ordinary), np.stack(tensor),
-            np.stack(ordinary30), np.stack(tensor30), pd.DataFrame(action_rows))
+    if not metadata:
+        raise ValueError("No eligible windows: check transition coverage and input files")
+    return pd.DataFrame(metadata), np.stack(ordinary), np.stack(tensor), pd.DataFrame(action_rows)
 
 
 def participant_baselines(metadata: pd.DataFrame, ordinary: np.ndarray, tensor: np.ndarray,
@@ -400,9 +487,9 @@ def participant_baselines(metadata: pd.DataFrame, ordinary: np.ndarray, tensor: 
 
 
 def evaluate_windows(metadata: pd.DataFrame, ordinary: np.ndarray, tensor: np.ndarray,
-                     ordinary30: np.ndarray, tensor30: np.ndarray,
                      baselines: dict[str, dict[str, np.ndarray]], prior_strength: float) -> pd.DataFrame:
     rows = []
+    cached_path, cached = None, None
     for index, meta in metadata.iterrows():
         baseline = baselines.get(str(meta.participant))
         if baseline is None:
@@ -412,26 +499,39 @@ def evaluate_windows(metadata: pd.DataFrame, ordinary: np.ndarray, tensor: np.nd
         if meta.condition == "ii":
             ordinary_reference -= ordinary[index]
             tensor_reference -= tensor[index]
-        if ordinary_reference.sum() < 30:
+        if ordinary_reference.sum() < MIN_REFERENCE_TRANSITIONS:
             continue
         ordinary_probability = row_probabilities(ordinary_reference)
         tensor_probability = row_probabilities(
             tensor_reference, np.broadcast_to(ordinary_probability, tensor_reference.shape), prior_strength)
+        if meta.action_cache != cached_path:  # windows of one recording are contiguous
+            with np.load(meta.action_cache) as handle:
+                cached = (handle["source"].astype(int), handle["action_weights"].astype(float))
+            cached_path = meta.action_cache
+        window = slice(int(meta.window_left), int(meta.window_right))
+        source, weights = cached[0][window], cached[1][window]
+        key = f"{meta.file_key}|{meta.window_start_s:.9f}"
+        tensor_ok = meta.n_action_transitions >= MIN_WINDOW_TRANSITIONS
+        valid = np.isfinite(weights).all(axis=1)
         result = meta.to_dict()
         result.update({
             "ordinary_js": weighted_js(ordinary[index], ordinary_probability),
+            "ordinary_js_null": null_expected_js(source, np.ones((len(source), 1)), ordinary_probability[None],
+                                                 key + "|null-ordinary"),
             "ordinary_kappa": fit_kappa(ordinary[index], ordinary_probability),
             "ordinary_entropy_concentration": entropy_concentration(ordinary[index]),
-            "tensor_js": weighted_js(tensor[index], tensor_probability) if meta.n_action_transitions >= 30 else np.nan,
-            "tensor_kappa": fit_kappa(tensor[index], tensor_probability) if meta.n_action_transitions >= 30 else np.nan,
-            "tensor_entropy_concentration": entropy_concentration(tensor[index]) if meta.n_action_transitions >= 30 else np.nan,
-            "ordinary_js_30": weighted_js(ordinary30[index], ordinary_probability),
-            "ordinary_kappa_30": fit_kappa(ordinary30[index], ordinary_probability),
-            "tensor_js_30": weighted_js(tensor30[index], tensor_probability) if np.isfinite(tensor30[index]).all() else np.nan,
-            "tensor_kappa_30": fit_kappa(tensor30[index], tensor_probability) if np.isfinite(tensor30[index]).all() else np.nan,
+            "tensor_js": weighted_js(tensor[index], tensor_probability) if tensor_ok else np.nan,
+            "tensor_js_null": (null_expected_js(source[valid], weights[valid], tensor_probability, key + "|null-tensor")
+                               if tensor_ok else np.nan),
+            "tensor_kappa": fit_kappa(tensor[index], tensor_probability) if tensor_ok else np.nan,
+            "tensor_entropy_concentration": entropy_concentration(tensor[index]) if tensor_ok else np.nan,
         })
         for stem in ("ordinary", "tensor"):
-            result[f"log_{stem}_js"] = math.log(max(result[f"{stem}_js"], 1e-12)) if np.isfinite(result[f"{stem}_js"]) else np.nan
+            result[f"{stem}_js_excess"] = result[f"{stem}_js"] - result[f"{stem}_js_null"]
+            result[f"{stem}_kappa_at_bound"] = bool(
+                np.isclose(result[f"{stem}_kappa"], math.exp(-4), rtol=0, atol=1e-8)
+                or np.isclose(result[f"{stem}_kappa"], math.exp(4), rtol=0, atol=1e-8))
+            result[f"log_{stem}_js"] = math.log(max(result[f"{stem}_js"], 1e-12)) if np.isfinite(result[f"{stem}_js"]) else np.nan  # descriptive only
             result[f"log_{stem}_kappa"] = math.log(result[f"{stem}_kappa"]) if result[f"{stem}_kappa"] > 0 else np.nan
         rows.append(result)
         if len(rows) % 5000 == 0:
@@ -480,7 +580,8 @@ def manifold(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                 loading_parts.append({"representation": representation, "component": f"PC{component + 1}",
                                       "feature": feature, "loading": loading,
                                       "explained_variance_ratio": model.explained_variance_ratio_[component]})
-    return pd.concat(score_parts, ignore_index=True), pd.DataFrame(loading_parts)
+    return (pd.concat(score_parts, ignore_index=True) if score_parts else pd.DataFrame(),
+            pd.DataFrame(loading_parts))
 
 
 def _trajectory_panel(axis: plt.Axes, scores: pd.DataFrame, column: str, levels: tuple[str, str],
@@ -608,117 +709,279 @@ def plot_baseline_precision(precision: pd.DataFrame, figures: Path) -> None:
     save_figure(fig, figures, "figure_03_baseline_B_tensor_precision")
 
 
+CONTRASTS = (("FS versus ES", "Welch participant-level t test"),
+             ("FS hypo versus hyper",
+              "participant-clustered OLS on participant-by-semiology means (CR2, Bell-McCaffrey df)"),
+             ("within-DD FS versus ES", "paired participant-level t test"))
+
+
+def plan_family(outcome: str, estimand: str, contrast: str) -> str:
+    """primary (Holm 2) / secondary (Holm 6) / descriptive (estimate and CI only, no hypothesis test)."""
+    if estimand == "final_minus_early":
+        if contrast == "FS versus ES" and outcome in PRIMARY_OUTCOMES:
+            return "primary"
+        if contrast == "FS versus ES" and outcome in SECONDARY_FS_ES_OUTCOMES:
+            return "secondary"
+        if contrast != "FS versus ES" and outcome in PRIMARY_OUTCOMES:
+            return "secondary"
+    return "descriptive"
+
+
+MULTIPLICITY = {"primary": "Holm across the two primary tests",
+                "secondary": "Holm across the six secondary tests; supporting evidence, cannot rescue a negative primary",
+                "descriptive": "none: estimate with pointwise 95% CI, no hypothesis test"}
+
+
 def confirmatory_plan() -> pd.DataFrame:
     rows = []
-    for outcome in ("log_ordinary_js", "log_ordinary_kappa", "log_tensor_js", "log_tensor_kappa"):
+    for outcome in OUTCOMES:
         for estimand in ("final_minute", "final_minus_early"):
-            for contrast, test in (("FS versus ES", "Welch participant-level t test"),
-                                   ("FS hypo versus hyper", "participant-clustered OLS on participant-by-semiology means"),
-                                   ("within-DD FS versus ES", "paired participant-level t test")):
+            for contrast, test in CONTRASTS:
+                family = plan_family(outcome, estimand, contrast)
                 rows.append({"outcome": outcome, "estimand": estimand, "contrast": contrast, "test": test,
                              "tensor_definition": "soft CPI/CSI gradient quadrants at genuine transition times",
-                             "alternative": "two-sided",
-                             "multiplicity": "Holm family-wise correction across 24 planned tests",
+                             "alternative": "two-sided", "family": family, "multiplicity": MULTIPLICITY[family],
                              "status": "WITHHELD_PENDING_PREREGISTRATION"})
     return pd.DataFrame(rows)
 
 
+def cluster_cr2(y: np.ndarray, design: np.ndarray, groups: np.ndarray, contrast: np.ndarray) -> dict[str, float]:
+    """OLS contrast with CR2 cluster-robust variance and Bell-McCaffrey (Satterthwaite) degrees of freedom.
+
+    CR1 with t(G-1) is liberal with few or unbalanced clusters (type I 0.07-0.09 at 8/4 and 9/3 clusters per
+    stratum in simulation); CR2 with Satterthwaite df is close to nominal.  The working model is independent
+    errors with equal variance.
+    """
+    y = np.asarray(y, float)
+    x = np.asarray(design, float)
+    c = np.asarray(contrast, float)
+    n = len(y)
+    bread = np.linalg.inv(x.T @ x)
+    hat = x @ bread @ x.T
+    adjust = np.eye(n) - hat
+    ids = pd.factorize(groups)[0]
+    b_vector = bread @ c
+    q = np.zeros((n, n))
+    for g in range(ids.max() + 1):
+        idx = np.flatnonzero(ids == g)
+        values, vectors = np.linalg.eigh(adjust[np.ix_(idx, idx)])
+        scale = np.where(values > 1e-10, 1 / np.sqrt(np.clip(values, 1e-10, None)), 0.0)
+        inverse_root = vectors @ np.diag(scale) @ vectors.T
+        b_g = inverse_root @ x[idx] @ b_vector
+        row = b_g @ adjust[idx, :]
+        q += np.outer(row, row)
+    estimate = float(c @ bread @ x.T @ y)
+    variance = float(y @ q @ y)
+    trace, trace_square = float(np.trace(q)), float(np.sum(q * q))
+    df = trace * trace / trace_square if trace_square > 0 else np.nan
+    se = math.sqrt(max(variance, 0.0))
+    t_value = estimate / se if se > 0 else np.nan
+    p_value = float(2 * student_t.sf(abs(t_value), df)) if np.isfinite(t_value) and np.isfinite(df) else np.nan
+    margin = float(student_t.ppf(.975, df) * se) if np.isfinite(df) else np.nan
+    return {"estimate": estimate, "se": se, "t": t_value, "p": p_value, "df": df,
+            "ci95_low": estimate - margin, "ci95_high": estimate + margin}
+
+
 def clustered_hypo_hyper(frame: pd.DataFrame) -> dict[str, float | int]:
-    """Estimate hyper-minus-hypo while retaining participants represented in either or both strata."""
+    """Hyper-minus-hypo from participant-by-semiology means, keeping participants in either or both strata."""
     values = frame[frame.semiology.astype(str).str.lower().isin(("hypo", "hyper"))].copy()
     values = values.dropna(subset=["participant", "value"])
     values["is_hyper"] = values.semiology.astype(str).str.lower().eq("hyper").astype(float)
     counts = values.groupby("semiology", observed=True).size()
+    by_stratum = values.groupby("is_hyper", observed=True).participant.nunique()
     overlap = values.groupby("participant", observed=True).is_hyper.nunique().ge(2).sum()
-    if values.participant.nunique() < 3 or values.is_hyper.nunique() < 2:
-        return {"estimate": np.nan, "t": np.nan, "p": np.nan,
-                "n_first": int(counts.get("hypo", 0)), "n_second": int(counts.get("hyper", 0)),
-                "n_clusters": int(values.participant.nunique()), "n_overlap": int(overlap),
-                "df": np.nan, "ci95_low": np.nan, "ci95_high": np.nan}
-    design = sm.add_constant(values[["is_hyper"]], has_constant="add")
-    fitted = sm.OLS(values.value.to_numpy(), design.to_numpy()).fit()
-    robust = fitted.get_robustcov_results(
-        cov_type="cluster", groups=values.participant.to_numpy(),
-        use_correction=True, df_correction=True, use_t=True)
-    confidence = robust.conf_int(alpha=.05)[1]
-    return {"estimate": float(robust.params[1]), "t": float(robust.tvalues[1]),
-            "p": float(robust.pvalues[1]), "n_first": int(counts.get("hypo", 0)),
-            "n_second": int(counts.get("hyper", 0)),
-            "n_clusters": int(values.participant.nunique()), "n_overlap": int(overlap),
-            "df": float(getattr(robust, "df_resid_inference", robust.df_resid)),
-            "ci95_low": float(confidence[0]), "ci95_high": float(confidence[1])}
+    result = {"estimate": np.nan, "t": np.nan, "p": np.nan, "n_first": int(counts.get("hypo", 0)),
+              "n_second": int(counts.get("hyper", 0)), "n_clusters": int(values.participant.nunique()),
+              "n_overlap": int(overlap), "df": np.nan, "ci95_low": np.nan, "ci95_high": np.nan}
+    if by_stratum.get(0.0, 0) < MIN_CLUSTERS_PER_SEMIOLOGY or by_stratum.get(1.0, 0) < MIN_CLUSTERS_PER_SEMIOLOGY:
+        return result
+    design = np.column_stack([np.ones(len(values)), values.is_hyper.to_numpy()])
+    fitted = cluster_cr2(values.value.to_numpy(), design, values.participant.to_numpy(), np.array([0.0, 1.0]))
+    result.update({key: fitted[key] for key in ("estimate", "t", "p", "df", "ci95_low", "ci95_high")})
+    return result
+
+
+def planned_interval_cells(metrics: pd.DataFrame, final_endpoint: float = 0.0) -> pd.DataFrame:
+    """Whole windows within early [-1200,-600]; exactly [-60,0] for final (``final_endpoint`` 60 = [-120,-60)).
+
+    Returns per event/interval the mean of each outcome over its eligible windows and the number of
+    eligible windows (``n_<outcome>``).
+    """
+    keys = ["participant", "event_key", "group", "event_type", "semiology"]
+    pre = metrics.loc[metrics.condition.eq("preict")].copy()
+    endpoint = pre.window_end_to_ictus_s
+    early = endpoint.ge(600) & endpoint.le(1140)
+    final = np.isclose(endpoint, final_endpoint, rtol=0, atol=1e-8)
+    pre = pre.loc[early | final].copy()
+    pre["time_bin"] = np.where(np.isclose(pre.window_end_to_ictus_s, final_endpoint, rtol=0, atol=1e-8),
+                               TIME_BINS[-1], TIME_BINS[0])
+    grouped = pre.groupby([*keys, "time_bin"], observed=True, dropna=False)
+    means = grouped[list(OUTCOMES)].mean().reset_index()
+    counts = grouped[list(OUTCOMES)].count().add_prefix("n_").reset_index(drop=True)
+    return pd.concat([means, counts], axis=1)
+
+
+def event_changes(cells: pd.DataFrame, outcome: str, min_early_windows: int = MIN_EARLY_WINDOWS) -> pd.DataFrame:
+    """One row per event with finite final and early values and >= ``min_early_windows`` early windows."""
+    keys = ["participant", "event_key", "group", "event_type", "semiology"]
+    early = cells[cells.time_bin.eq(TIME_BINS[0])][keys + [outcome, f"n_{outcome}"]].rename(
+        columns={outcome: "early", f"n_{outcome}": "n_early"})
+    final = cells[cells.time_bin.eq(TIME_BINS[-1])][keys + [outcome]].rename(columns={outcome: "final_minute"})
+    event = final.merge(early, on=keys, how="inner", validate="one_to_one")
+    keep = np.isfinite(event[["early", "final_minute"]]).all(axis=1) & event.n_early.ge(min_early_windows)
+    event = event.loc[keep].copy()
+    event["final_minus_early"] = event.final_minute - event.early
+    return event
+
+
+def independent_groups(event: pd.DataFrame, estimand: str) -> tuple[pd.Series, pd.Series]:
+    table = event[event.group.isin(["FS", "ES"])].groupby(
+        ["participant", "group"], observed=True, as_index=False)[estimand].mean().rename(columns={estimand: "value"})
+    if table.participant.duplicated().any():
+        raise ValueError("Independent FS/ES comparison contains overlapping participants")
+    return (table[table.group.eq("FS")].value.dropna().reset_index(drop=True),
+            table[table.group.eq("ES")].value.dropna().reset_index(drop=True))
+
+
+def welch_summary(fs: pd.Series, es: pd.Series) -> dict[str, float | int]:
+    estimate = fs.mean() - es.mean()
+    estimable = len(fs) > 1 and len(es) > 1
+    test = ttest_ind(fs, es, equal_var=False) if estimable else None
+    fs_component = fs.var(ddof=1) / len(fs) if len(fs) > 1 else np.nan
+    es_component = es.var(ddof=1) / len(es) if len(es) > 1 else np.nan
+    standard_error = np.sqrt(fs_component + es_component)
+    df = ((fs_component + es_component) ** 2 /
+          (fs_component ** 2 / (len(fs) - 1) + es_component ** 2 / (len(es) - 1))) if test else np.nan
+    margin = student_t.ppf(.975, df) * standard_error if test else np.nan
+    return {"estimate": estimate, "t": test.statistic if test else np.nan, "p": test.pvalue if test else np.nan,
+            "n_first": len(fs), "n_second": len(es), "n_clusters": len(fs) + len(es), "n_overlap": 0, "df": df,
+            "ci95_low": estimate - margin, "ci95_high": estimate + margin}
+
+
+def dd_pairs(event: pd.DataFrame, estimand: str) -> pd.DataFrame:
+    return (event[event.group.eq("DD")].groupby(["participant", "event_type"], observed=True, as_index=False)[estimand]
+            .mean().pivot(index="participant", columns="event_type", values=estimand)
+            .reindex(columns=["FS", "ES"]).dropna())
+
+
+def paired_summary(dd: pd.DataFrame) -> dict[str, float | int]:
+    difference = (dd.FS - dd.ES) if len(dd) else pd.Series(dtype=float)
+    estimate = difference.mean() if len(dd) else np.nan
+    estimable = len(dd) >= MIN_DD_PAIRS
+    test = ttest_rel(dd.FS, dd.ES) if estimable else None
+    df = len(dd) - 1 if estimable else np.nan
+    margin = student_t.ppf(.975, df) * difference.std(ddof=1) / np.sqrt(len(dd)) if estimable else np.nan
+    return {"estimate": estimate, "t": test.statistic if test else np.nan, "p": test.pvalue if test else np.nan,
+            "n_first": len(dd), "n_second": len(dd), "n_clusters": len(dd), "n_overlap": len(dd), "df": df,
+            "ci95_low": estimate - margin, "ci95_high": estimate + margin}
 
 
 def run_confirmatory(metrics: pd.DataFrame, preregistration_id: str) -> pd.DataFrame:
-    outcomes = ("log_ordinary_js", "log_ordinary_kappa", "log_tensor_js", "log_tensor_kappa")
-    keys = ["participant", "event_key", "group", "event_type", "semiology"]
-    cells = metrics[metrics.condition.eq("preict") & metrics.time_bin.isin((TIME_BINS[0], TIME_BINS[-1]))].groupby(
-        [*keys, "time_bin"], observed=True, dropna=False, as_index=False)[list(outcomes)].mean()
+    cells = planned_interval_cells(metrics)
+    plan = confirmatory_plan()
     rows = []
-    for outcome in outcomes:
-        early = cells[cells.time_bin.eq(TIME_BINS[0])][keys + [outcome]].rename(columns={outcome: "early"})
-        final = cells[cells.time_bin.eq(TIME_BINS[-1])][keys + [outcome]].rename(columns={outcome: "final_minute"})
-        event = final.merge(early, on=keys, how="inner", validate="one_to_one")
-        event["final_minus_early"] = event.final_minute - event.early
+    for outcome in OUTCOMES:
+        event = event_changes(cells, outcome)
         for estimand in ("final_minute", "final_minus_early"):
-            independent = event[event.group.isin(["FS", "ES"])].groupby(
-                ["participant", "group"], observed=True, as_index=False)[estimand].mean().rename(
-                    columns={estimand: "value"})
-            fs = independent[independent.group.eq("FS")].value.dropna()
-            es = independent[independent.group.eq("ES")].value.dropna()
-            test = ttest_ind(fs, es, equal_var=False) if len(fs) > 1 and len(es) > 1 else None
-            estimate = fs.mean() - es.mean()
-            fs_component = fs.var(ddof=1) / len(fs) if len(fs) > 1 else np.nan
-            es_component = es.var(ddof=1) / len(es) if len(es) > 1 else np.nan
-            standard_error = np.sqrt(fs_component + es_component)
-            df = ((fs_component + es_component) ** 2 /
-                  (fs_component ** 2 / (len(fs) - 1) + es_component ** 2 / (len(es) - 1))) if test else np.nan
-            margin = student_t.ppf(.975, df) * standard_error if test else np.nan
-            rows.append({"preregistration_id": preregistration_id, "outcome": outcome, "estimand": estimand,
-                         "contrast": "FS versus ES", "test": "Welch participant-level t test",
-                         "estimate_direction": "FS minus ES", "estimate": estimate,
-                         "t": test.statistic if test else np.nan, "p": test.pvalue if test else np.nan,
-                         "n_first": len(fs), "n_second": len(es), "n_clusters": len(fs) + len(es),
-                         "n_overlap": 0, "df": df, "ci95_low": estimate - margin,
-                         "ci95_high": estimate + margin})
+            fs, es = independent_groups(event, estimand)
             semiology = event[event.event_type.eq("FS") & event.semiology.isin(("hypo", "hyper"))].groupby(
                 ["participant", "semiology"], observed=True, as_index=False)[estimand].mean().rename(
                     columns={estimand: "value"})
-            semiology_result = clustered_hypo_hyper(semiology)
-            rows.append({"preregistration_id": preregistration_id, "outcome": outcome, "estimand": estimand,
-                         "contrast": "FS hypo versus hyper",
-                         "test": "participant-clustered OLS on participant-by-semiology means",
-                         "estimate_direction": "hyper minus hypo", **semiology_result})
-            dd = (event[event.group.eq("DD")].groupby(
-                ["participant", "event_type"], observed=True, as_index=False)[estimand].mean()
-                  .pivot(index="participant", columns="event_type", values=estimand).dropna())
-            test = ttest_rel(dd.FS, dd.ES) if {"FS", "ES"}.issubset(dd) and len(dd) > 1 else None
-            paired_difference = dd.FS - dd.ES if len(dd) else pd.Series(dtype=float)
-            estimate = paired_difference.mean() if len(dd) else np.nan
-            df = len(dd) - 1 if test else np.nan
-            margin = (student_t.ppf(.975, df) * paired_difference.std(ddof=1) / np.sqrt(len(dd))
-                      if test else np.nan)
-            rows.append({"preregistration_id": preregistration_id, "outcome": outcome, "estimand": estimand,
-                         "contrast": "within-DD FS versus ES", "test": "paired participant-level t test",
-                         "estimate_direction": "FS minus ES", "estimate": estimate,
-                         "t": test.statistic if test else np.nan, "p": test.pvalue if test else np.nan,
-                         "n_first": len(dd), "n_second": len(dd), "n_clusters": len(dd),
-                         "n_overlap": len(dd), "df": df, "ci95_low": estimate - margin,
-                         "ci95_high": estimate + margin})
-    result = pd.DataFrame(rows)
-    valid = result.p.notna()
-    if valid.any():
-        p_values = result.loc[valid, "p"].to_numpy()
-        order = np.argsort(p_values)
-        adjusted_ordered = np.maximum.accumulate((len(p_values) - np.arange(len(p_values))) * p_values[order])
-        adjusted = np.empty(len(p_values)); adjusted[order] = np.clip(adjusted_ordered, 0, 1)
-        result.loc[valid, "p_holm"] = adjusted
-    return result
+            for contrast, test, direction, summary in (
+                    ("FS versus ES", CONTRASTS[0][1], "FS minus ES", welch_summary(fs, es)),
+                    ("FS hypo versus hyper", CONTRASTS[1][1], "hyper minus hypo", clustered_hypo_hyper(semiology)),
+                    ("within-DD FS versus ES", CONTRASTS[2][1], "FS minus ES",
+                     paired_summary(dd_pairs(event, estimand)))):
+                rows.append({"preregistration_id": preregistration_id, "outcome": outcome, "estimand": estimand,
+                             "contrast": contrast, "test": test, "estimate_direction": direction, **summary})
+    result = pd.DataFrame(rows).merge(plan[["outcome", "estimand", "contrast", "family", "multiplicity"]],
+                                      on=["outcome", "estimand", "contrast"], validate="one_to_one")
+    descriptive = result.family.eq("descriptive")
+    result.loc[descriptive, ["t", "p"]] = np.nan  # estimates and CIs only: no hypothesis test is reported
+    result["status"] = np.where(descriptive, "descriptive_estimate_only",
+                                np.where(np.isfinite(result.p), "estimated", "not_estimable"))
+    result["p_holm"] = np.nan
+    for family in ("primary", "secondary"):
+        mask = result.family.eq(family)
+        # Unavailable tests stay in the registered family, conservatively as p=1.
+        adjusted = multipletests(result.loc[mask, "p"].fillna(1).to_numpy(), method="holm")[1]
+        result.loc[mask, "p_holm"] = np.where(np.isfinite(result.loc[mask, "p"]), adjusted, np.nan)
+    result["ci_scope"] = "pointwise_95_not_multiplicity_adjusted"
+    order = {"primary": 0, "secondary": 1, "descriptive": 2}
+    result["_order"] = result.family.map(order)
+    return result.sort_values(["_order", "outcome", "estimand", "contrast"]).drop(columns="_order").reset_index(drop=True)
+
+
+def primary_sensitivity(metrics: pd.DataFrame) -> pd.DataFrame:
+    """Labelled sensitivities for the independent FS-ES change tests (primary and secondary outcomes).
+
+    * Yuen 20% trimmed Welch test (robust to heavy tails and outlying participants);
+    * studentised permutation test of the Welch statistic (no normality assumption);
+    * the same contrast with the pre-final window [-120,-60) in place of [-60,0), checking that results are not
+      driven by onset artefact in the last minute.
+    None replaces or rescues the registered tests; no multiplicity adjustment is applied.
+    """
+    rows = []
+    cells = planned_interval_cells(metrics)
+    shifted = planned_interval_cells(metrics, final_endpoint=60.0)
+    for outcome in (*PRIMARY_OUTCOMES, *SECONDARY_FS_ES_OUTCOMES):
+        fs, es = independent_groups(event_changes(cells, outcome), "final_minus_early")
+        base = {"outcome": outcome, "estimand": "final_minus_early", "contrast": "FS versus ES",
+                "analysis_scope": "sensitivity_not_primary_confirmation", "n_first": len(fs), "n_second": len(es)}
+        ok = len(fs) > 2 and len(es) > 2
+        trimmed = ttest_ind(fs, es, equal_var=False, trim=TRIM) if ok else None
+        rows.append({**base, "analysis": "yuen_20pct_trimmed_welch",
+                     "estimate": trim_mean(fs, TRIM) - trim_mean(es, TRIM) if ok else np.nan,
+                     "t": trimmed.statistic if ok else np.nan, "p": trimmed.pvalue if ok else np.nan})
+        if ok:
+            permutation = permutation_test(
+                (fs.to_numpy(), es.to_numpy()),
+                lambda a, b, axis: ttest_ind(a, b, axis=axis, equal_var=False).statistic,
+                permutation_type="independent", n_resamples=PERMUTATIONS, alternative="two-sided",
+                random_state=stable_rng(f"permutation|{outcome}"))
+            rows.append({**base, "analysis": "studentised_permutation", "estimate": fs.mean() - es.mean(),
+                         "t": float(permutation.statistic), "p": float(permutation.pvalue)})
+        else:
+            rows.append({**base, "analysis": "studentised_permutation", "estimate": np.nan, "t": np.nan, "p": np.nan})
+        fs_p, es_p = independent_groups(event_changes(shifted, outcome), "final_minus_early")
+        welch = welch_summary(fs_p, es_p)
+        rows.append({**base, "analysis": "prefinal_window_-120_to_-60", "n_first": len(fs_p), "n_second": len(es_p),
+                     "estimate": welch["estimate"], "t": welch["t"], "p": welch["p"]})
+    return pd.DataFrame(rows)
+
+
+def coverage_table(index: pd.DataFrame, metrics: pd.DataFrame) -> pd.DataFrame:
+    """Pre-outcome eligibility accounting by group and outcome (counts only; no outcome values are compared)."""
+    events = index[index.condition.eq("preict")][["participant", "file_path", "group"]].drop_duplicates().rename(
+        columns={"file_path": "event_key"})
+    cells = planned_interval_cells(metrics)
+    produced = set(metrics[metrics.condition.eq("preict")].event_key)
+    rows = []
+    for outcome in OUTCOMES:
+        n_col = f"n_{outcome}"
+        final = cells[cells.time_bin.eq(TIME_BINS[-1]) & np.isfinite(cells[outcome])].event_key
+        early = cells[cells.time_bin.eq(TIME_BINS[0]) & cells[n_col].ge(MIN_EARLY_WINDOWS) &
+                      np.isfinite(cells[outcome])].event_key
+        complete = set(final) & set(early)
+        for group, subset in events.groupby("group", observed=True):
+            keys = set(subset.event_key)
+            rows.append({"group": group, "outcome": outcome, "events_in_index": len(keys),
+                         "events_with_any_evaluated_window": len(keys & produced),
+                         "events_final_window_eligible": len(keys & set(final)),
+                         "events_with_min_early_windows": len(keys & set(early)),
+                         "events_complete": len(keys & complete),
+                         "participants_in_index": subset.participant.nunique(),
+                         "participants_complete": subset[subset.event_key.isin(complete)].participant.nunique()})
+    return pd.DataFrame(rows)
 
 
 def sample_summary(metrics: pd.DataFrame) -> dict[str, object]:
     preictal = metrics[metrics.condition.eq("preict")]
-    selected = preictal[preictal.time_bin.isin((TIME_BINS[0], TIME_BINS[-1]))]
+    selected = planned_interval_cells(metrics)
+    # Counts are outcome-specific; this conservative summary requires all four outcomes.
+    selected = selected.loc[np.isfinite(selected[list(OUTCOMES)]).all(axis=1)]
+    enough = selected.time_bin.eq(TIME_BINS[-1]) | selected[[f"n_{o}" for o in OUTCOMES]].ge(MIN_EARLY_WINDOWS).all(axis=1)
+    selected = selected.loc[enough]
     event_bins = selected.groupby(
         ["participant", "event_key", "group", "event_type", "semiology"],
         observed=True, dropna=False).time_bin.nunique().reset_index(name="n_bins")
@@ -726,7 +989,7 @@ def sample_summary(metrics: pd.DataFrame) -> dict[str, object]:
     fs = complete[complete.event_type.eq("FS") & complete.semiology.isin(("hypo", "hyper"))]
     overlap = fs.groupby("participant", observed=True).semiology.nunique().eq(2).sum()
     dd = (complete[complete.group.eq("DD")].groupby(
-        ["participant", "event_type"], observed=True).size().unstack().dropna())
+        ["participant", "event_type"], observed=True).size().unstack().reindex(columns=["FS", "ES"]).dropna())
     return {
         "analysis_ready_participants": int(metrics.participant.nunique()),
         "participants_by_diagnostic_group": {
@@ -749,106 +1012,64 @@ def sample_summary(metrics: pd.DataFrame) -> dict[str, object]:
 
 
 def osf_preregistration_blurbs(summary: dict[str, object]) -> str:
-    groups = summary["participants_by_diagnostic_group"]
-    events = summary["preictal_events_by_event_type"]
-    complete = summary["complete_early_and_final_events_by_event_type"]
-    independent = summary["independent_complete_participants"]
-    semi_events = summary["fs_complete_events_by_semiology"]
-    semi_participants = summary["fs_complete_participants_by_semiology"]
-    return f"""# OSF preregistration paste-ready blurbs
-
-## Title
-Exact-timestamp microstate transition dynamics and autonomic-gradient tensors in functional and epileptic seizures.
-
-## Research question
-Do functional seizures (FS) and epileptic seizures (ES) differ in global transition-matrix divergence and baseline-oriented concentration immediately before onset, and in their change from an early preictal interval? We will also test FS semiology and within-participant diagnostic contrasts.
-
-## Hypotheses
-We will test two-sided differences in ordinary-matrix and autonomic-gradient-tensor JS divergence and κ for: (1) independent FS versus ES groups, (2) hypomotor versus hypermotor FS, and (3) paired FS versus ES events in dual-diagnosis (DD) participants. Each contrast is tested for the final minute and for final-minus-early change. Directional interpretation will follow the signed estimates but significance testing is two-sided.
-
-## Study type and design
-This is a preregistered confirmatory analysis of an existing observational EEG/ECG dataset. Microstate transitions are observed at their genuine EEG sample timestamps (1/256 s). Heartbeat-resolved CSI/CPI levels and finite-difference gradients are interpolated only within observed temporal support. No exposure is randomized or manipulated.
-
-## Existing data and prior knowledge
-Data collection and preprocessing are complete. The analysis pipeline and descriptive plots have been developed and inspected. The 24 confirmatory group/semiology p-values have not been run; they remain software-locked pending an immutable OSF registration. This timing and all prior descriptive access will be disclosed.
-
-## Registration timing
-This is a preregistration of analyses on existing data, not a prospective registration before data collection. Registration will be made immutable before the locked confirmatory command is run. Descriptive access and pipeline development occurred before registration; confirmatory results did not.
-
-## Data collection procedure
-EEG and ECG were recorded during interictal periods and around clinically classified FS and ES events. Previously fitted six-state microstate backfits are reused. Ordered state changes are extracted at native EEG sample resolution, and heartbeat-resolved autonomic summaries are aligned to those genuine transition times without extrapolation.
-
-## Sampling and sample size
-The locked analysis-ready dataset contains {summary['analysis_ready_participants']} participants (FS={groups.get('FS', 0)}, ES={groups.get('ES', 0)}, DD={groups.get('DD', 0)}) and {events.get('FS', 0)} FS plus {events.get('ES', 0)} ES preictal events. Complete early-and-final coverage is available for {complete.get('FS', 0)} FS and {complete.get('ES', 0)} ES events. The independent comparison contains {independent.get('FS', 0)} FS and {independent.get('ES', 0)} ES participants. This is a fixed available sample; precision and detectable-effect simulations, not post-hoc observed power, will be used to discuss sufficiency.
-
-## Stopping rule
-The sample is the complete locked, analysis-ready dataset available at preregistration. No further participants or events will be added to the confirmatory analysis after inspecting results.
-
-## Variables and conditions
-The exposure labels are diagnostic group/event type (FS or ES), FS semiology (hypomotor or hypermotor), and time interval. The early interval is −20 to −10 minutes and the final interval is −1 to 0 minutes relative to genuine onset. DD participants contribute paired FS and ES observations.
-
-## Manipulated variables, randomization, and blinding
-There are no manipulated variables, randomized assignments, or experimental conditions. Group and event labels are observed clinical classifications. The analysis is not blinded because those labels are required to construct the pre-specified contrasts.
-
-## Measured variables
-The measured inputs are ordered microstate source/destination transitions, transition timestamps, CPI and CSI levels, CPI and CSI temporal gradients, diagnostic/event labels, FS semiology, participant, event, and time relative to onset.
-
-## Primary outcomes
-Four transformed outcomes are confirmatory: log ordinary transition-matrix JS divergence, log ordinary baseline-oriented κ, log autonomic-gradient-tensor JS divergence, and log autonomic-gradient-tensor κ. The tensor conditions are soft probabilities for increasing/decreasing CPI crossed with increasing/decreasing CSI at each genuine transition timestamp.
-
-## Indices and scale construction
-Ordinary JS measures divergence from the participant's interictal transition grammar. Ordinary κ measures sharpening or flattening along that baseline grammar. Tensor JS and κ apply the same definitions to four soft autonomic-gradient conditions: CPI↑/CSI↑, CPI↑/CSI↓, CPI↓/CSI↑, and CPI↓/CSI↓.
-
-## Data reduction and transformations
-Windows require at least 30 observed transitions. Event-level interval means are formed first, followed by participant-level means within the relevant diagnostic or semiology stratum. JS and κ are analysed on their pre-specified log scales. An exact-30-transition analysis is a sensitivity analysis, not a replacement for the primary estimates.
-
-## Exclusions and missing data
-Only windows supported by genuine transition timestamps and non-extrapolated autonomic interpolation are used. Both early and final intervals must be present for every primary estimand, including the final-minute contrast, so the analysis set is coverage-matched. No outcome-based exclusions or imputation will be used.
-
-## Statistical models
-Independent FS versus ES uses a two-sided Welch participant-level t test. FS hypomotor versus hypermotor uses OLS on participant-by-semiology means with participant-clustered, small-sample-corrected standard errors; the coefficient is hyper minus hypo. The locked FS semiology data contain {semi_events.get('hypo', 0)} hypomotor and {semi_events.get('hyper', 0)} hypermotor complete events from {semi_participants.get('hypo', 0)} and {semi_participants.get('hyper', 0)} participants respectively, with {summary['fs_participants_in_both_semiology_strata']} participants represented in both strata. The within-DD comparison uses a paired participant-level t test in {summary['paired_dd_complete_participants']} complete participants.
-
-## Multiplicity and decision rule
-There are 4 outcomes × 2 estimands × 3 contrasts = 24 planned two-sided tests. Holm correction controls the family-wise error rate across all 24 tests. Adjusted p<0.05 is the confirmatory threshold; estimates, confidence information, raw p-values, and adjusted p-values will all be reported.
-
-## Sensitivity analyses
-We will repeat outcome construction after equalising every eligible window to exactly 30 transitions. We will also describe complete temporal coverage and interpolation support. Sensitivity results will be labelled as such and will not alter the primary multiplicity family.
-
-## Exploratory analyses
-Entropy concentration, destination/source-specific transition effects, autonomic levels and trajectories, peri-ictal 2D manifold movement, and baseline tensor precision are exploratory/descriptive. No large route-by-time hypothesis-test family will be generated. Pseudo-onset analyses are not part of this confirmatory onset-specific claim.
-
-## Causal interpretation
-All analyses are associational. Temporal ordering and interpolation do not identify a causal effect of autonomic change on microstate transitions or the reverse. We will not use causal language.
-
-## Transparency and deviations
-The uploaded lock records SHA-256 hashes of the plan, code, runner, and frozen inputs. After registration, the confirmatory command will abort before testing if any hash differs. Any deviation will be documented, justified, time-stamped, and clearly separated from the preregistered analysis.
-
-## Software and reproducibility
-The supplied Python and PowerShell code is the executable specification. The confirmatory runner performs synthetic self-checks, verifies every registered hash, skips regeneration of frozen backfits, and emits a separate execution record containing the registration identifier and result-file hash.
-
-## Files to upload with the registration
-Upload `OSF_PREREGISTRATION_BLURBS.md`, `POST_REGISTRATION_RUNBOOK.md`, `PREREGISTRATION_LOCK.json`, `PREREGISTRATION_LOCK.sha256`, `tables/confirmatory_analysis_plan_WITHHELD.csv`, and the locked code copies in `code/`. Retain the full review package and its `SHA256SUMS.csv` as the audit bundle.
-"""
+    text = (Path(__file__).resolve().parent / "PREREGISTRATION.md").read_text(encoding="utf-8")
+    fence = chr(96) * 3
+    return text + "\n\n## Prepared cohort (computed without group tests)\n\n" + fence + "json\n" + json.dumps(summary, indent=2) + "\n" + fence + "\n"
 
 
 def post_registration_runbook() -> str:
-    return r"""# Confirmatory runbook (use only after immutable OSF registration)
+    return (Path(__file__).resolve().parent / "docs/RUNBOOK.md").read_text(encoding="utf-8")
 
-1. Upload the files listed in `OSF_PREREGISTRATION_BLURBS.md`, complete the OSF form, and create an immutable registration rather than merely saving a draft.
-2. Copy the public registration URL or DOI. Do not rerun the descriptive/locking mode and do not edit the locked code or inputs.
-3. Open PowerShell and run exactly:
 
-```powershell
-Set-Location -LiteralPath 'C:\Users\Admin\PycharmProjects\FS_MS'
-.\run_timestamped_transition_pipeline.ps1 `
-  -RunConfirmatory `
-  -PreregistrationId 'https://osf.io/REPLACE_WITH_REGISTRATION_ID'
-```
 
-4. The command first runs synthetic self-checks and then verifies the SHA-256 sidecar, the 24-test plan, all locked code, and all frozen inputs. It skips MATLAB fitting/export so those frozen inputs cannot be silently regenerated. Any mismatch stops execution before confirmatory statistics.
-5. A successful run writes `tables/confirmatory_results.csv` and `CONFIRMATORY_EXECUTION.json` to `C:\Users\Admin\OneDrive - NHS\FS_MS\publication_timestamped_prereg`, and refreshes the adjacent review package. Confirm that `all_registered_hashes_verified_before_statistics` is `true` and archive both files without editing them.
-6. Report all 24 tests, their signed estimates and 95% confidence intervals, raw p-values, and Holm-adjusted p-values. Label exact-30, manifold, autonomic-state, source/destination, and entropy analyses as sensitivity or exploratory as preregistered.
-"""
+
+def runtime_versions() -> dict[str, str]:
+    return {"python": platform.python_version(), **{name: importlib.metadata.version(name) for name in
+        ("numpy", "pandas", "scipy", "scikit-learn", "statsmodels", "matplotlib", "h5py")}}
+
+
+def transition_cache_digest(path: Path) -> str:
+    """SHA-256 of the transition CONTENT (sampling rate, length, sample indices, from/to states).
+
+    MATLAB v7.3 files embed a creation timestamp, so the same transitions rebuilt later differ at byte level.
+    Hashing content makes the data-freeze lock reproducible across independent runs and across a healed cache,
+    while any change to a transition still changes the digest.
+    """
+    cache = load_transition_cache(path)
+    digest = hashlib.sha256()
+    digest.update(f"{float(cache['sfreq'])!r}|{int(cache['n_samples'])}".encode())
+    for key in ("sample", "from", "to"):
+        digest.update(np.ascontiguousarray(cache[key]).tobytes())
+    return digest.hexdigest()
+
+
+def direct_cache_hashes(index_path: Path) -> dict[str, str]:
+    index = pd.read_csv(index_path, usecols=["cache_file"])
+    paths = [Path(str(value)) for value in index.cache_file]
+    if any(not p.is_absolute() for p in paths):
+        raise ValueError("Transition cache paths must be absolute to remove working-directory ambiguity")
+    return {str(p): transition_cache_digest(p) for p in sorted(set(paths))}
+
+
+def validate_registration_id(value: str) -> None:
+    url = urlparse(value)
+    if (url.scheme != "https" or url.hostname not in {"osf.io", "doi.org"}
+            or not url.path.strip("/") or any(x in value.lower() for x in ("replace", "placeholder", "example"))):
+        raise ValueError("Supply the actual immutable registration HTTPS URL at osf.io or doi.org")
+    # URL syntax is checked; only the researcher can attest that it is an immutable registration.
+
+
+def artifact_digest(path: Path) -> str:
+    """File hash for the freeze lock; JSON artifacts ignore top-level ``*_utc`` timestamps (rebuilt-identical stages)."""
+    if path.suffix.lower() == ".json":
+        try:
+            value = json.loads(path.read_text(encoding="utf-8-sig"))
+        except ValueError:
+            return sha256(path)
+        if isinstance(value, dict):
+            value = {k: v for k, v in value.items() if not k.endswith("_utc")}
+        return sha256_text(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str))
+    return sha256(path)
 
 
 def write_preregistration_lock(output: Path, artifact_paths: dict[str, Path],
@@ -857,16 +1078,22 @@ def write_preregistration_lock(output: Path, artifact_paths: dict[str, Path],
                                hash_provenance: str = "computed directly from files in this locked run") -> dict[str, object]:
     prehashed = prehashed or {}
     artifacts = {name: {"file_name": path.name,
-                        "sha256": prehashed[name] if name in prehashed else sha256(path)}
+                        "sha256": prehashed[name] if name in prehashed else artifact_digest(path)}
                  for name, path in artifact_paths.items()}
     lock = {
-        "schema": "fs-ms-preregistration-lock/v1",
+        "schema": "fs-ms-preregistration-lock/v2",
         "status": "LOCKED_PENDING_PREREGISTRATION",
         "locked_utc": datetime.now(timezone.utc).isoformat(),
         "hash_algorithm": "SHA-256",
         "confirmatory_statistics_run": False,
         "unlock_condition": "immutable OSF registration plus --run-confirmatory and its public registration identifier",
         "planned_test_count": 24,
+        "descriptive_estimate_only_count": 16,
+        "primary_test_count": 2,
+        "secondary_test_count": 6,
+        "analysis_settings": ANALYSIS_SETTINGS,
+        "runtime_versions": runtime_versions(),
+        "direct_transition_caches": direct_cache_hashes(artifact_paths["transition_index"]),
         "route_level_test_count": 0,
         "locked_plan_sha256": plan_hash,
         "hash_provenance": hash_provenance,
@@ -882,54 +1109,7 @@ def write_preregistration_lock(output: Path, artifact_paths: dict[str, Path],
 
 
 def refresh_lock_from_existing(args: argparse.Namespace) -> None:
-    """Refresh only preregistration documents; never calculate inferential statistics."""
-    output, tables = args.out_dir, args.out_dir / "tables"
-    metrics_path = tables / "timestamped_window_metrics.csv.gz"
-    audit_path = output / "ANALYSIS_AUDIT.json"
-    if not metrics_path.exists() or not audit_path.exists():
-        raise RuntimeError("Existing locked metrics and ANALYSIS_AUDIT.json are required")
-    audit = json.loads(audit_path.read_text(encoding="utf-8"))
-    if audit.get("confirmatory_statistics_run") is not False:
-        raise RuntimeError("Existing audit is not a no-statistics run")
-    repo = Path(__file__).resolve().parent
-    scripts = [Path(__file__).resolve(), repo / "recover_timestamped_transition_backfits.m",
-               repo / "run_timestamped_transition_pipeline.ps1",
-               repo / "external/VG-microstates/fit_microstate_hierarchical_dataset.m",
-               repo / "external/VG-microstates/_internal/matlab/backfit_microstate_timecourse.m"]
-    plan = confirmatory_plan()
-    plan_text = plan.to_csv(index=False, lineterminator="\n")
-    plan_hash = sha256_text(plan_text)
-    summary = sample_summary(pd.read_csv(metrics_path))
-    write_text_exact(tables / "confirmatory_analysis_plan_WITHHELD.csv", plan_text)
-    write_text_exact(output / "OSF_PREREGISTRATION_BLURBS.md", osf_preregistration_blurbs(summary))
-    write_text_exact(output / "POST_REGISTRATION_RUNBOOK.md", post_registration_runbook())
-    recovery_audit_path = args.transition_index.parent / "recovery_audit.json"
-    artifact_paths = {
-        "analysis_plan": tables / "confirmatory_analysis_plan_WITHHELD.csv",
-        "osf_preregistration_blurbs": output / "OSF_PREREGISTRATION_BLURBS.md",
-        "post_registration_runbook": output / "POST_REGISTRATION_RUNBOOK.md",
-        "analysis_python": scripts[0], "backfit_exporter_matlab": scripts[1],
-        "timestamped_runner_powershell": scripts[2], "hierarchy_fit_matlab": scripts[3],
-        "backfit_function_matlab": scripts[4], "transition_index": args.transition_index,
-        "backfit_recovery_audit": recovery_audit_path, "autonomic_native_input": args.autonomic_native,
-        "manifest_input": args.manifest,
-    }
-    prior_inputs = {normalise_path(path): value for path, value in audit.get("inputs", {}).items()}
-    input_roles = ("transition_index", "backfit_recovery_audit", "autonomic_native_input", "manifest_input")
-    prehashed = {}
-    for role in input_roles:
-        key = normalise_path(str(artifact_paths[role]))
-        if key not in prior_inputs:
-            raise RuntimeError(f"Prior audited hash is missing for {artifact_paths[role]}")
-        prehashed[role] = prior_inputs[key]
-    write_preregistration_lock(
-        output, artifact_paths, plan_hash, summary, prehashed=prehashed,
-        hash_provenance=("frozen input hashes carried forward from the existing no-statistics ANALYSIS_AUDIT.json "
-                         f"({audit.get('completed_utc')}); every file will be re-hashed before inference"))
-    if args.review_dir:
-        update_review(output, args.review_dir, scripts)
-    print(json.dumps({"preregistration_lock_refreshed": True, "confirmatory_statistics_run": False,
-                      "prehashed_artifact_roles": sorted(prehashed)}, indent=2))
+    raise RuntimeError("Lock refresh is disabled: corrected measurements require --prepare in a NEW output directory")
 
 
 def verify_preregistration_lock(output: Path, artifact_paths: dict[str, Path],
@@ -943,18 +1123,24 @@ def verify_preregistration_lock(output: Path, artifact_paths: dict[str, Path],
     if sidecar_hash != lock_hash:
         raise RuntimeError("PREREGISTRATION_LOCK.sha256 does not match PREREGISTRATION_LOCK.json")
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    if lock.get("schema") != "fs-ms-preregistration-lock/v1" or lock.get("status") != "LOCKED_PENDING_PREREGISTRATION":
+    if lock.get("schema") != "fs-ms-preregistration-lock/v2" or lock.get("status") != "LOCKED_PENDING_PREREGISTRATION":
         raise RuntimeError("Preregistration lock schema or status is invalid")
     if lock.get("confirmatory_statistics_run") is not False:
         raise RuntimeError("Preregistration lock indicates that confirmatory statistics were already run")
     if lock.get("planned_test_count") != 24 or lock.get("locked_plan_sha256") != expected_plan_hash:
         raise RuntimeError("Current confirmatory plan does not match the preregistered plan")
+    if lock.get("runtime_versions") != runtime_versions():
+        raise RuntimeError("Runtime versions differ from registration; restore the locked environment")
+    if lock.get("analysis_settings") != ANALYSIS_SETTINGS:
+        raise RuntimeError("Analysis settings differ from registration")
+    if lock.get("direct_transition_caches") != direct_cache_hashes(artifact_paths["transition_index"]):
+        raise RuntimeError("A directly consumed transition cache differs from registration")
     locked_artifacts = lock.get("artifacts", {})
     if set(locked_artifacts) != set(artifact_paths):
         raise RuntimeError("Locked artifact set does not match the current pipeline artifact set")
     mismatches = []
     for name, path in artifact_paths.items():
-        if not path.exists() or sha256(path) != locked_artifacts[name].get("sha256"):
+        if not path.exists() or artifact_digest(path) != locked_artifacts[name].get("sha256"):
             mismatches.append(name)
     if mismatches:
         raise RuntimeError("Preregistration hash mismatch: " + ", ".join(mismatches))
@@ -1036,17 +1222,19 @@ def self_check() -> None:
     ]
     confirmatory_rows = []
     for number, (participant, group, event_type, semiology, value) in enumerate(event_design):
-        for time_bin, offset in ((TIME_BINS[0], 0.), (TIME_BINS[-1], .05 + .01 * (number % 4))):
+        for endpoint in (600., 610., 620., 630., 640., 0.):
+            offset = 0. if endpoint else .05 + .01 * (number % 4)
             row = {"participant": participant, "event_key": f"E{number}", "group": group,
                    "event_type": event_type, "semiology": semiology,
-                   "condition": "preict", "time_bin": time_bin}
-            row.update({outcome: value + offset for outcome in
-                        ("log_ordinary_js", "log_ordinary_kappa", "log_tensor_js", "log_tensor_kappa")})
+                   "condition": "preict", "window_end_to_ictus_s": endpoint}
+            row.update({outcome: value + offset for outcome in OUTCOMES})
             confirmatory_rows.append(row)
     synthetic_result = run_confirmatory(pd.DataFrame(confirmatory_rows), "synthetic-preregistration")
     assert len(synthetic_result) == 24
+    assert synthetic_result.family.value_counts().to_dict() == {"descriptive": 16, "secondary": 6, "primary": 2}
+    assert synthetic_result.loc[synthetic_result.family.eq("descriptive"), ["t", "p", "p_holm"]].isna().all().all()
     synthetic_primary = synthetic_result[
-        synthetic_result.outcome.eq("log_ordinary_js") & synthetic_result.estimand.eq("final_minute")]
+        synthetic_result.outcome.eq("ordinary_js_excess") & synthetic_result.estimand.eq("final_minute")]
     assert synthetic_primary.loc[synthetic_primary.contrast.eq("FS versus ES"), "n_first"].iat[0] == 3
     assert synthetic_primary.loc[synthetic_primary.contrast.eq("FS hypo versus hyper"), "n_overlap"].iat[0] == 1
     assert synthetic_primary.loc[synthetic_primary.contrast.eq("within-DD FS versus ES"), "n_first"].iat[0] == 3
@@ -1060,11 +1248,16 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--review-dir", type=Path)
-    parser.add_argument("--prior-strength", type=float, default=10)
+    parser.add_argument("--plan-lock", type=Path,
+                        help="prereg/PLAN_LOCK.json; when given, its hash is bound into the data-freeze lock")
+    parser.add_argument("--prior-strength", type=float, default=PRIOR_STRENGTH)
     parser.add_argument("--run-confirmatory", action="store_true")
     parser.add_argument("--preregistration-id", default="")
     parser.add_argument("--refresh-preregistration-lock", action="store_true")
     parser.add_argument("--self-check", action="store_true")
+    parser.add_argument("--prepare", action="store_true", help="Explicitly compute descriptive measurements in a fresh directory")
+    parser.add_argument("--check-inputs", action="store_true", help="Check input availability only, without data analysis")
+    parser.add_argument("--verify-lock", action="store_true", help="Verify the frozen bundle without fitting or testing")
     args = parser.parse_args()
     if args.self_check:
         self_check(); return
@@ -1076,8 +1269,24 @@ def main() -> None:
         except RuntimeError as error:
             parser.error(str(error))
         return
-    if args.run_confirmatory and not args.preregistration_id.strip():
-        parser.error("--run-confirmatory requires --preregistration-id after preregistration")
+    if sum(bool(x) for x in (args.prepare, args.check_inputs, args.verify_lock, args.run_confirmatory)) != 1:
+        parser.error("Choose exactly one mode: --check-inputs, --prepare, --verify-lock, or --run-confirmatory")
+    if args.prior_strength != PRIOR_STRENGTH:
+        parser.error("Prior strength is fixed at 10; changing it requires an explicit protocol amendment")
+    if args.run_confirmatory:
+        try:
+            validate_registration_id(args.preregistration_id.strip())
+        except ValueError as error:
+            parser.error(str(error))
+    if args.check_inputs:
+        paths = [args.transition_index, args.autonomic_native, args.manifest,
+                 args.transition_index.parent / "recovery_audit.json"]
+        missing = [str(p) for p in paths if not p.is_file()]
+        print(json.dumps({"mode": "check_inputs_only", "missing_paths": missing, "ready": not missing,
+                          "runtime": runtime_versions()}, indent=2))
+        if missing:
+            raise SystemExit(2)
+        return
     for path in (args.transition_index, args.autonomic_native, args.manifest):
         if not path.exists(): parser.error(f"Input does not exist: {path}")
     recovery_audit_path = args.transition_index.parent / "recovery_audit.json"
@@ -1087,13 +1296,19 @@ def main() -> None:
     if not (recovery_audit.get("compact_export_validated_against_full_backfit") and
             focused_gate.get("transition_matrix_exact_match")):
         parser.error("Backfit recovery did not pass both exact validation gates")
+    try:
+        fit_to_canonical(recovery_audit.get("fit_labels", ()))
+    except ValueError as error:
+        parser.error(f"recovery_audit.json lacks valid derived fit_labels (rerun the microstates stage): {error}")
 
     output, tables, figures = args.out_dir, args.out_dir / "tables", args.out_dir / "figures"
     repo = Path(__file__).resolve().parent
     scripts = [Path(__file__).resolve(), repo / "recover_timestamped_transition_backfits.m",
-               repo / "run_timestamped_transition_pipeline.ps1",
+               repo / "run_pipeline.py",
                repo / "external/VG-microstates/fit_microstate_hierarchical_dataset.m",
-               repo / "external/VG-microstates/_internal/matlab/backfit_microstate_timecourse.m"]
+               repo / "external/VG-microstates/_internal/matlab/backfit_microstate_timecourse.m",
+               repo / "run_vg_microstates.m", repo / "requirements-lock.txt", repo / "docs/STATISTICAL_ANALYSIS_PLAN.md",
+               repo / "PREREGISTRATION.md", repo / "docs/RUNBOOK.md"]
     plan = confirmatory_plan()
     plan_text = plan.to_csv(index=False, lineterminator="\n")
     plan_hash = sha256_text(plan_text)
@@ -1102,32 +1317,76 @@ def main() -> None:
         "osf_preregistration_blurbs": output / "OSF_PREREGISTRATION_BLURBS.md",
         "post_registration_runbook": output / "POST_REGISTRATION_RUNBOOK.md",
         "analysis_python": scripts[0], "backfit_exporter_matlab": scripts[1],
-        "timestamped_runner_powershell": scripts[2], "hierarchy_fit_matlab": scripts[3],
+        "pipeline_runner": scripts[2], "hierarchy_fit_matlab": scripts[3],
         "backfit_function_matlab": scripts[4], "transition_index": args.transition_index,
         "backfit_recovery_audit": recovery_audit_path, "autonomic_native_input": args.autonomic_native,
         "manifest_input": args.manifest,
+        "upstream_runner": scripts[5], "dependencies": scripts[6], "statistical_analysis_plan": scripts[7],
+        "preregistration_source": scripts[8], "runbook_source": scripts[9],
+        "prepared_metrics": tables / "timestamped_window_metrics.csv.gz",
+        "prepared_audit": output / "ANALYSIS_AUDIT.json",
     }
+    if args.plan_lock:
+        if not args.plan_lock.is_file():
+            parser.error(f"Plan lock does not exist: {args.plan_lock}")
+        artifact_paths["plan_lock"] = args.plan_lock
     registered_lock = None
     registered_lock_hash = None
-    if args.run_confirmatory:
+    if args.run_confirmatory or args.verify_lock:
         try:
             registered_lock, registered_lock_hash = verify_preregistration_lock(output, artifact_paths, plan_hash)
         except RuntimeError as error:
             parser.error(str(error))
 
-    tables.mkdir(parents=True, exist_ok=True); figures.mkdir(exist_ok=True)
-    if not args.run_confirmatory:
-        for stale in (tables / "confirmatory_results.csv", output / "CONFIRMATORY_EXECUTION.json"):
-            if stale.exists():
-                stale.unlink()
+    if args.verify_lock:
+        print(json.dumps({"status": "verified_without_statistics", "lock_sha256": registered_lock_hash}))
+        return
+    if args.run_confirmatory:
+        result_path = tables / "confirmatory_results.csv"
+        execution_path = output / "CONFIRMATORY_EXECUTION.json"
+        if result_path.exists() or execution_path.exists():
+            parser.error("A confirmatory result/execution already exists; preserve it rather than overwrite")
+        metrics = pd.read_csv(artifact_paths["prepared_metrics"])
+        with result_path.open("x", encoding="utf-8", newline="") as stream:
+            run_confirmatory(metrics, args.preregistration_id.strip()).to_csv(stream, index=False)
+        sensitivity_path = tables / "primary_sensitivity_results.csv"
+        sensitivity = primary_sensitivity(metrics)
+        with sensitivity_path.open("x", encoding="utf-8", newline="") as stream:
+            sensitivity.to_csv(stream, index=False)
+        execution = {"schema": "fs-ms-confirmatory-execution/v2", "status": "EXECUTED_AFTER_RESEARCHER_REGISTRATION_ATTESTATION",
+            "executed_utc": datetime.now(timezone.utc).isoformat(),
+            "preregistration_id": args.preregistration_id.strip(),
+            "registration_existence_independently_verified": False,
+            "registered_lock_sha256": registered_lock_hash,
+            "all_registered_hashes_verified_before_statistics": True,
+            "confirmatory_results_sha256": sha256(result_path),
+            "primary_sensitivity_sha256": sha256(sensitivity_path)}
+        write_text_exact(execution_path, json.dumps(execution, indent=2, sort_keys=True) + "\n")
+        if args.review_dir:
+            update_review(output, args.review_dir, scripts)
+        print(json.dumps(execution, indent=2))
+        return
+    if output.exists() and any(output.iterdir()):
+        parser.error("Preparation requires a NEW empty output directory; existing results and locks are preserved")
+    output.mkdir(parents=True, exist_ok=True)
+    tables.mkdir(); figures.mkdir()
+    initial_input_hashes = {str(p): sha256(p) for p in
+                           (args.transition_index, args.autonomic_native, args.manifest, recovery_audit_path)}
+    initial_cache_hashes = direct_cache_hashes(args.transition_index)
     shutil.copy2(recovery_audit_path, output / "BACKFIT_RECOVERY_AUDIT.json")
     index = pd.read_csv(args.transition_index)
+    if index.file_path.duplicated().any():
+        raise ValueError("Duplicate recording identity in transition index")
+    if index[["participant", "group"]].drop_duplicates().participant.duplicated().any():
+        raise ValueError("Participant has conflicting diagnostic groups")
     index["file_key"] = normalise_path(index.file_path)
     index["condition"] = index.condition.astype(str).str.lower()
     manifest = pd.read_csv(args.manifest)
     manifest["file_key"] = normalise_path(manifest.file_path)
     event_columns = [column for column in ("file_key", "seizure_type", "hypo_hyper") if column in manifest]
-    event = manifest[event_columns].drop_duplicates("file_key")
+    event = manifest[event_columns].drop_duplicates()
+    if event.file_key.duplicated().any():
+        raise ValueError("Conflicting event labels in manifest")
     index = index.merge(event, on="file_key", how="left", validate="one_to_one")
     index["event_type"] = index.get("seizure_type", pd.Series(index=index.index, dtype=object)).astype(str).str.upper()
     index.loc[~index.event_type.isin(["FS", "ES"]), "event_type"] = np.nan
@@ -1135,18 +1394,17 @@ def main() -> None:
     index.loc[~index.semiology.isin(["hypo", "hyper"]), "semiology"] = np.nan
 
     native = load_native(args.autonomic_native, set(index.file_key))
-    metadata, ordinary, tensor, ordinary30, tensor30, action_index = build_windows(
-        index, native, output / "transition_action_cache")
+    metadata, ordinary, tensor, action_index = build_windows(
+        index, native, output / "transition_action_cache", recovery_audit["fit_labels"])
     baselines, precision = participant_baselines(metadata, ordinary, tensor, args.prior_strength)
-    metrics = evaluate_windows(metadata, ordinary, tensor, ordinary30, tensor30, baselines, args.prior_strength)
+    metrics = evaluate_windows(metadata, ordinary, tensor, baselines, args.prior_strength)
     baseline_probability = baseline_tables(baselines, metadata)
     scores, loadings = manifold(metrics)
 
     metadata.to_csv(tables / "timestamped_window_metadata.csv.gz", index=False, compression="gzip")
     action_index.to_csv(tables / "transition_action_cache_index.csv", index=False)
     np.savez_compressed(tables / "timestamped_window_matrices.npz", ordinary=ordinary.astype(np.uint16),
-                        tensor=tensor.astype(np.float32), ordinary_exact30=ordinary30.astype(np.uint8),
-                        tensor_exact30=tensor30.astype(np.float32))
+                        tensor=tensor.astype(np.float32))
     metrics.to_csv(tables / "timestamped_window_metrics.csv.gz", index=False, compression="gzip")
     baseline_probability.to_csv(tables / "baseline_B_tensor_probabilities.csv.gz", index=False, compression="gzip")
     precision.to_csv(tables / "baseline_B_tensor_precision_cells.csv.gz", index=False, compression="gzip")
@@ -1160,29 +1418,14 @@ def main() -> None:
     scores.to_csv(tables / "peri_ictal_manifold_scores.csv.gz", index=False, compression="gzip")
     loadings.to_csv(tables / "peri_ictal_manifold_loadings.csv", index=False)
     summary = sample_summary(metrics)
+    coverage_table(index, metrics).to_csv(tables / "coverage_by_group.csv", index=False)
     if not args.run_confirmatory:
         write_text_exact(tables / "confirmatory_analysis_plan_WITHHELD.csv", plan_text)
         write_text_exact(output / "OSF_PREREGISTRATION_BLURBS.md", osf_preregistration_blurbs(summary))
         write_text_exact(output / "POST_REGISTRATION_RUNBOOK.md", post_registration_runbook())
-        registered_lock = write_preregistration_lock(output, artifact_paths, plan_hash, summary)
-        registered_lock_hash = sha256(output / "PREREGISTRATION_LOCK.json")
-    if args.run_confirmatory:
-        result_path = tables / "confirmatory_results.csv"
-        run_confirmatory(metrics, args.preregistration_id.strip()).to_csv(result_path, index=False)
-        execution = {
-            "schema": "fs-ms-confirmatory-execution/v1", "status": "EXECUTED_AFTER_PREREGISTRATION",
-            "executed_utc": datetime.now(timezone.utc).isoformat(),
-            "preregistration_id": args.preregistration_id.strip(),
-            "registered_lock_sha256": registered_lock_hash,
-            "registered_plan_sha256": registered_lock["locked_plan_sha256"],
-            "all_registered_hashes_verified_before_statistics": True,
-            "confirmatory_results_sha256": sha256(result_path),
-            "verified_artifacts": registered_lock["artifacts"],
-        }
-        write_text_exact(output / "CONFIRMATORY_EXECUTION.json",
-                         json.dumps(execution, indent=2, sort_keys=True) + "\n")
 
-    plot_manifold(scores, figures)
+    if not scores.empty:
+        plot_manifold(scores, figures)
     plot_matrix_trajectories(metrics, figures)
     plot_baseline_precision(precision, figures)
     plot_autonomic_state_trajectories(metrics, figures)
@@ -1195,14 +1438,19 @@ def main() -> None:
         "gradient_definition": "centred finite-difference slopes on heartbeat times, interpolated without extrapolation; soft signs scaled by record median absolute slope",
         "autonomic_state_description": "CPI/CSI levels, soft level quadrants and peri-ictal level trajectories retained descriptively",
         "canonical_state_order": list(STATES), "action_order": list(ACTIONS),
-        "minimum_transitions": 30, "exact_30_sensitivity": True,
+        "minimum_window_transitions": MIN_WINDOW_TRANSITIONS,
+        "minimum_reference_transitions": MIN_REFERENCE_TRANSITIONS, "minimum_early_windows": MIN_EARLY_WINDOWS,
+        "js_outcome": "null-calibrated excess JS (JS - E0); E0 = mean JS over hash-seeded parametric-bootstrap "
+                      "destinations drawn from the participant reference given the window's own sources and soft weights",
+        "null_draws": NULL_DRAWS, "log_js_descriptive_only": True,
+        "family_sizes": {"primary": 2, "secondary": 6, "descriptive_estimate_only": 16},
         "route_level_hypothesis_tests": 0,
         "confirmatory_statistics_run": bool(args.run_confirmatory),
         "preregistration_id": args.preregistration_id.strip() if args.run_confirmatory else None,
         "preregistration_lock_sha256": registered_lock_hash,
-        "registered_plan_sha256": registered_lock["locked_plan_sha256"],
+        "registered_plan_sha256": plan_hash,
         "preregistration_hashes_verified_before_statistics": bool(args.run_confirmatory),
-        "hypo_hyper_test": "participant-clustered OLS on participant-by-semiology means",
+        "hypo_hyper_test": "participant-clustered OLS on participant-by-semiology means, CR2 + Bell-McCaffrey df",
         "n_transition_records": len(index), "n_exact_transitions": int(action_index.n_transitions.sum()),
         "n_transitions_with_interpolated_action": int(action_index.n_with_interpolated_action.sum()),
         "interpolated_action_fraction": float(action_index.n_with_interpolated_action.sum() / action_index.n_transitions.sum()),
@@ -1212,6 +1460,12 @@ def main() -> None:
                    (args.transition_index, recovery_audit_path, args.autonomic_native, args.manifest)},
     }
     write_text_exact(output / "ANALYSIS_AUDIT.json", json.dumps(audit, indent=2) + "\n")
+    if any(sha256(Path(p)) != digest for p, digest in initial_input_hashes.items()):
+        raise RuntimeError("Inputs changed during preparation; do not register this incomplete bundle")
+    if initial_cache_hashes != direct_cache_hashes(args.transition_index):
+        raise RuntimeError("Transition cache changed during preparation; do not register this bundle")
+    registered_lock = write_preregistration_lock(output, artifact_paths, plan_hash, summary)
+    registered_lock_hash = sha256(output / "PREREGISTRATION_LOCK.json")
     (output / "README.md").write_text(
         "# Timestamped transition analysis\n\n"
         "This run uses every genuine ordered microstate transition at EEG-sample resolution and linearly "

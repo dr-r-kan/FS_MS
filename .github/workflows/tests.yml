@@ -1,0 +1,22 @@
+name: Synthetic validation
+on: [push, pull_request]
+jobs:
+  test:
+    # The pinned environment and the path guard are Windows-specific (drive-letter paths).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.7'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - run: python -m pip install -r requirements-lock.txt
+      # Synthetic fixtures only. Slow MATLAB/TUEG end-to-end tests are opt-in via FSMS_RUN_SLOW=1 and are
+      # skipped here (no MATLAB, no TUEG corpus, and never any real study data).
+      - run: python -B -m unittest discover -s tests -v
+      - run: python -B -m fsms.provenance --verify
+      - name: Verify plan lock once a registration exists
+        shell: bash
+        run: |
+          if [ -f prereg/REGISTRATION.json ]; then python -B run_pipeline.py verify-lock; else echo "no registration yet: lock check skipped"; fi

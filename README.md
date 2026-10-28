@@ -1,72 +1,59 @@
-# FS_MS global-first analysis
+# FS_MS — preregistration-ready microstate transition pipeline
 
-The publication pipeline reuses the fitted K=6 microstates and starts with the
-whole transition grammar. No microstate is privileged in the headline model.
+Does the change in autonomic-gradient-conditioned EEG microstate transition organisation approaching seizure
+onset differ between functional-seizure-only (FS) and epileptic-seizure-only (ES) participants?
 
-The primary transition quantities are:
+This repository runs the whole analysis from raw EDF clips to the registered confirmatory tests:
 
-- global Jensen–Shannon divergence from each participant's interictal grammar;
-- one global baseline-oriented concentration parameter, κ.
-
-Interictal windows use a leave-that-window-out participant baseline. Preictal
-windows use the participant's pooled interictal baseline. The fixed transition
-threshold is 30; transition count is an eligibility/information quantity, not a
-predictor.
-
-After the global analysis, the pipeline:
-
-- drills down across all six source microstates as BH-FDR-controlled exploratory work;
-- tests exploratory CSI, CPI and semiology associations by source state;
-- fits an auditable two-dimensional PCA manifold in JS, κ, CSI and CPI and plots
-  FS and ES movement from II through five preictal bins;
-- fits planned nested logistic models in the order JS → κ → CSI → CPI,
-  evaluated with leave-one-participant-out predictions;
-- adds paired FS−ES trajectories within dual-diagnosis participants and
-  participant-clustered hypo−hyper trajectories within the FS cohort;
-- retains the participant-matched genuine/pseudo difference-in-differences so a
-  phenotype is not mislabeled as an onset-specific biomarker.
-
-The pipeline then fits the action-conditioned mechanistic extension documented
-in `FS_action_conditioned_transition_pipeline_v5/MODEL_SPECIFICATION.md`. It
-uses four softly interpolated CPI/CSI action corners, validates the interictal
-tensor participant-wise, evaluates preceding-window timing, and tests the
-reverse transition-to-next-action direction with participant-held-out models.
-The source inputs remain 60-second summaries; no transition-level causal claim
-is made.
-
-Run the complete reusable pipeline with:
-
-```powershell
-run_everything.cmd
+```
+clips (EDF) → HEPPy EEG/ECG preprocessing → VG-microstates (K=6 VB-GMM, template labels, exact transitions)
+            → CSI/CPI autonomic table → timestamped transition tensor → preregistered tests
 ```
 
-The one interactive step is confirming the six global labels if the reusable
-hierarchy has not already completed. Existing microstate fits, ECG caches and
-completed upstream stages are reused.
+* **Preregistered question and plan:** [`PREREGISTRATION.md`](PREREGISTRATION.md),
+  [`docs/STATISTICAL_ANALYSIS_PLAN.md`](docs/STATISTICAL_ANALYSIS_PLAN.md)
+* **How to run, lock and register:** [`docs/RUNBOOK.md`](docs/RUNBOOK.md)
 
-To rebuild only the global-first publication analysis from retained data:
+## Quick start
 
 ```powershell
-.\.venv\Scripts\python.exe -B analyse_global_transition_exploration.py `
-  --peak-windows-csv "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced\data\directional_peak_backfit_windows.csv" `
-  --common-windows-csv "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced\data\autonomic_peak_microstate_common_windows.csv.gz" `
-  --focused-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\balanced" `
-  --manifest "G:\FS_microstates_study\vg_microstates\vg_microstate_manifest_mat_paper_20260723.csv" `
-  --demographics-csv ".\analysis_database.csv" `
-  --out-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\publication_final" `
-  --review-dir "C:\Users\Admin\OneDrive - NHS\FS_MS\for_review" `
-  --overwrite
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v   # synthetic tests, no data
+.\run_pipeline.ps1 preflight --deep                               # environment, MATLAB/SPM/EEGLAB, locks
 ```
 
-`publication_final` contains six 400-dpi/vector publication figures, exact
-analysis frames, PCA loadings/scores, participant-held-out predictions,
-exploratory source models, matched-pseudo balance, decisions and hashes.
-`for_review` is a self-contained small review package with the single analysis
-scripts, compressed reused inputs, all result tables and figures. The complete
-pipeline also adds `action_tensor/`, `lagged_sensitivity/`, `directionality/`,
-`MECHANISTIC_EXTENSION_RESULTS.md`, and `MECHANISTIC_EXTENSION_AUDIT.json` to
-both output packages.
+Validate the full chain on Temple University EEG (TUEG) recordings with synthetic labels — no real data:
 
-The prior confirmatory hierarchy and 3D displays are not part of the headline
-pipeline: the attempted confirmatory fits failed validation, and the 2D
-four-variable manifold is more complete and easier to interpret.
+```powershell
+$env:FSMS_RUN_SLOW = '1'
+.\run_pipeline.ps1 fixture
+.\run_pipeline.ps1 run --config config\fixture_tueg.json --confirm
+```
+
+## Design guarantees
+
+| Guarantee | How |
+|---|---|
+| Real data stays untouched until registration | `config/study.json` is `kind: real`; `fsms.lock` refuses every data-touching stage until `register` records the immutable registration against the verified plan lock. Fixture configs are rejected if any path is inside restricted study storage. |
+| Idempotent | every stage records a fingerprint (parameters + code + upstream outputs) and its output hashes; a rerun with no change executes nothing and rewrites nothing; per-recording sentinels in HEPPy; atomic writes; stale preparations are archived, never deleted. |
+| Reproducible | pinned environment (`requirements-lock.txt`, 44 packages), explicit seeds, vendored external code with tree hashes (`external/PROVENANCE.json`), line-ending-independent hashing. |
+| No analyst degrees of freedom in preprocessing | HEPPy exclusion rule, microstate labelling rule (`template_prespecified_v2`) and ECG/autonomic QC thresholds are fixed in code/config, group-blind, reason-coded; nothing is hand-labelled. |
+| Confirmatory tests only after registration | `stats_confirm` needs `--confirm`; verifies the data-freeze lock first; refuses to overwrite existing results. |
+
+## Layout
+
+| Path | Purpose |
+|---|---|
+| `run_pipeline.py`, `run_pipeline.ps1` | single entry point |
+| `fsms/` | orchestration (`pipeline`, `ledger`, `lock`, `guard`, `config`, `provenance`), stage drivers (`heppy/`, `clips/`, `manifest/`, `matlab/`, `autonomic.py`), TUEG `fixture/` |
+| `analyse_timestamped_transition_dynamics.py` | measurement and inference (prepare / verify-lock / confirmatory) |
+| `config/` | study and fixture configuration, HEPPy options |
+| `prereg/` | plan lock and (after registration) the registration record |
+| `external/` | vendored HEPPy and VG-microstates with provenance |
+| `tests/` | synthetic unit tests; opt-in slow end-to-end fixture test |
+| `legacy/`, root `analyse_*.py`, `build_*.py` | earlier exploratory work, kept for provenance; not part of the registered pipeline |
+
+External code: [HEPPy](https://github.com/dr-r-kan/HEPPy) and VG-microstates (private repository
+`dr-r-kan/VG-microstates`; the vendored tree is a modified derivative, see `external/PROVENANCE.json`).
+Requires Windows, Python 3.12.7, MATLAB R2025a with [SPM](https://github.com/spm/spm) and EEGLAB.
