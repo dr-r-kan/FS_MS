@@ -74,7 +74,7 @@ class ManifestBase(unittest.TestCase):
     patients = ("P1", "P2", "P3", "P4")
 
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="fsms_vg_test_"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="fsms_vg_test_")).resolve()  # resolve: Windows 8.3 short temp names (CI runner)
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.heppy = self.tmp / "heppy_output"
         self.out = self.tmp / "vg"

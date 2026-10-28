@@ -411,7 +411,7 @@ class RuleTests(unittest.TestCase):
 
 class StageTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="fsms_heppy_test_"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="fsms_heppy_test_")).resolve()  # resolve: Windows 8.3 short temp names
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.clips = make_clips(self.tmp, ["P1_snips", "P2_snips", "P3_snips"])
         self.out = self.tmp / "heppy_output"
@@ -639,7 +639,7 @@ def make_legacy_tree(root: Path, bases: list[str], options: dict | None = None) 
 
 class AdoptionTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="fsms_adopt_test_"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="fsms_adopt_test_")).resolve()  # resolve: Windows 8.3 short temp names
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.bases = ["A_snips", "B_snips", "C_snips", "D_snips"]
         self.clips = make_clips(self.tmp, self.bases)
