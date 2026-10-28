@@ -17,15 +17,16 @@ def sha256_file(path: str | os.PathLike[str], chunk: int = 1 << 22) -> str:
     return digest.hexdigest()
 
 
-TEXT_SUFFIXES = {".py", ".m", ".md", ".json", ".txt", ".csv", ".ps1", ".yml", ".yaml", ".cff", ".cmd",
-                 ".cfg", ".toml", ".ini", ".sha256"}
-
-
 def sha256_normalised(path: str | os.PathLike[str]) -> str:
-    """SHA-256 that ignores CRLF vs LF for text files, so locks verify on any checkout/autocrlf setting."""
-    if Path(path).suffix.lower() not in TEXT_SUFFIXES:
-        return sha256_file(path)
-    return hashlib.sha256(Path(path).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+    """SHA-256 that ignores CRLF vs LF in text files, so locks verify on any checkout/autocrlf setting.
+
+    Text is decided the way git decides it: a file with no NUL byte in its first 8 KiB.  (An extension list is
+    not enough: extension-less files such as LICENSE or .gitignore are text too.)  Binary files hash raw.
+    """
+    data = Path(path).read_bytes()
+    if b"\0" in data[:8192]:
+        return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
 
 
 def json_content_digest(path: str | os.PathLike[str]) -> str:

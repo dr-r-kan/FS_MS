@@ -106,6 +106,19 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(json.loads(target.read_text()), {"a": 1})
             self.assertEqual(list(Path(td).glob("*.part")), [])
 
+    def test_normalised_hash_treats_every_non_binary_file_as_text(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name in ("LICENSE", ".gitignore", "notes.bak", "script.m", "x.unknownext"):
+                crlf, lf = root / f"crlf_{name}", root / f"lf_{name}"
+                crlf.write_bytes(b"line one\r\nline two\r\n")
+                lf.write_bytes(b"line one\nline two\n")
+                self.assertEqual(atomic.sha256_normalised(crlf), atomic.sha256_normalised(lf), name)
+            binary_a, binary_b = root / "a.set", root / "b.set"
+            binary_a.write_bytes(b"\x00\x01MAT\r\n\x00")
+            binary_b.write_bytes(b"\x00\x01MAT\n\x00")
+            self.assertNotEqual(atomic.sha256_normalised(binary_a), atomic.sha256_normalised(binary_b))
+
     def test_json_content_digest_ignores_utc_and_order(self):
         with tempfile.TemporaryDirectory() as td:
             a, b = Path(td) / "a.json", Path(td) / "b.json"

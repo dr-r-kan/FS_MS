@@ -5,7 +5,7 @@
       "file_count": 9,
       "path": "external/HEPPy",
       "relationship": "Diverged fork: _preprocessing.py and hep.py are substantially extended (atomic saves, _both CFA mode, PyPREP fallbacks, ICLabel ONNX); ecg_peak_correction.py and heppy_stats.py are local additions. Upstream has no functional change newer than this vendored copy.",
-      "tree_sha256": "20f157a2f2cb7e0d3297ac57665e54777339681bea96a58db7bda2ab2b47c42a",
+      "tree_sha256": "b4200a544c2305d21277d35f65be18006b1e4ca883e3ca41c712717665ffa160",
       "upstream": "https://github.com/dr-r-kan/HEPPy",
       "upstream_reference": "main@758ef7c (2026-01-16); last upstream code change 2025-11-27"
     },
@@ -14,7 +14,7 @@
       "file_count": 66,
       "path": "external/VG-microstates",
       "relationship": "Modified derivative. Adds spm_mix_prior.m, fixed-reference inference, backfit changes and recovery commands that exist on no upstream branch. The earlier submodule pin (ClinicalAffectiveNeuroscienceLab/VG-microstates@1bba8fa776ee229635ff198b0421ff8efbea0a48) is not reachable, so the exact base cannot be recovered; the vendored tree hash below governs.",
-      "tree_sha256": "4aca26050e15036641a9072ba59d1033cf0101942c7643f5e0e6ba1e5c2e01fa",
+      "tree_sha256": "86a95b11a1d29b6a81a4bd05ac4492f7ca1e36ef3b2ebc06e216c78dd9ac3185",
       "upstream": "https://github.com/dr-r-kan/VG-microstates (private)",
       "upstream_reference": "closest branch: spm-ms-import-without-cardiac@18a67a8 (2026-07-04); master@32aad2c"
     }
