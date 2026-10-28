@@ -89,11 +89,17 @@ def native_indices(peaks: np.ndarray, recovered_peaks: np.ndarray, window_s: flo
         if (len(use) < 7 or t_rr[use[-1]] - t_rr[use[0]] < .8 * window_s or
                 not physiological[use].all() or interval_recovered[use].mean() > .10):
             continue
-        sd1, sd2, distance = poincare_features(rr[use])
+        local_rr = rr[use]
+        first_difference = np.diff(local_rr)
+        second_difference = np.diff(first_difference)
+        sd1, sd2, distance = poincare_features(local_rr)
         rows.append((np.median(t_rr[use]), t_rr[use[0]], t_rr[use[-1]], sd1, sd2, distance,
-                     len(use), interval_recovered[use].mean()))
+                     len(use), interval_recovered[use].mean(), local_rr.mean(), 60 / local_rr.mean(),
+                     first_difference.mean(), second_difference.mean() if len(second_difference) else np.nan,
+                     np.sqrt(np.mean(first_difference ** 2))))
     out = pd.DataFrame(rows, columns=["event_time_s", "window_start_s", "window_end_s", "sd1", "sd2",
-                                      "ccd", "n_ibi", "recovered_fraction"])
+                                      "ccd", "n_ibi", "recovered_fraction", "mean_rr_s", "mean_hr_bpm",
+                                      "rr_first_difference_s", "rr_acceleration_s", "rmssd_s"])
     if len(out) < 30:
         raise ValueError("fewer than 30 valid 15-second estimates")
     for column, reference in (("sd1", sd01), ("sd2", sd02), ("ccd", d0)):

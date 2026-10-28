@@ -1,0 +1,39 @@
+{
+  "schema": "fsms-config/v1",
+  "name": "fs_ms_real_study",
+  "kind": "real",
+  "_note": "REAL-STUDY CONFIG. data_root is restricted patient storage: no stage may read it until fsms.lock reports the plan as locked AND registered (run_pipeline.py register). Values below were NOT verified against the real folder (it was deliberately not touched before registration); the first post-registration `run` reports any path mismatch before processing.",
+  "paths": {
+    "data_root": "F:/FS_microstates_study",
+    "run_root": "F:/FS_MS_analysis/prereg_v2_run",
+    "adopt_heppy_dir": "F:/FS_microstates_study/heppy_output"
+  },
+  "clips": {
+    "mode": "adopt",
+    "dir": "clips",
+    "database": "analysis_database.csv",
+    "snip_keyfile": "clips/snip_keyfile.csv"
+  },
+  "heppy": {
+    "options": "config/heppy_options.json",
+    "workers": 4,
+    "adopt_existing": true
+  },
+  "manifest": {
+    "format": "mat",
+    "montage": "standard_1020",
+    "min_duration_s": 10,
+    "conditions": ["II", "preict"]
+  },
+  "microstates": {
+    "K": 6,
+    "labelling_rule": "template_prespecified_v2",
+    "classes": ["A", "B", "C", "E", "F", "G"],
+    "min_label_abs_r": 0.5
+  },
+  "analysis": {
+    "prior_strength": 10,
+    "max_autonomic_gap_s": 5.0,
+    "registration_id_placeholder": null
+  }
+}

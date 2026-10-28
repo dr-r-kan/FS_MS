@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "_comment": "REAL-STUDY HEPPy options: normalised copy of OLD/options_used.json plus explicit seeds, R-peak parameters (legacy defaults, previously implicit), target mains and the pre-specified group-blind QC exclusion rule (v2). Changing any processing key changes every per-recording fingerprint; changing qc_rule only re-evaluates exclusions.",
+  "mains_hz": 50,
+  "filters": {
+    "hp": 0.5,
+    "lp": 45.0,
+    "line_freqs": [
+      50.0,
+      100.0
+    ]
+  },
+  "ecg": {
+    "channel": "",
+    "flip_on_load": false
+  },
+  "montage": {
+    "name": "standard_1020",
+    "rename_to_1020": true
+  },
+  "pyprep": true,
+  "prep_ransac": false,
+  "asr": false,
+  "ica_iclabel": true,
+  "cfa_mode": "both",
+  "remove_cfa_mode": "both",
+  "target_sfreq": null,
+  "adaptive_rr": {
+    "rr_min_bpm": 35.0,
+    "rr_max_bpm": 140.0,
+    "rr_outlier_mad": 3.5,
+    "bpm_smooth_win": 5
+  },
+  "epoch": {
+    "tmin": -0.2,
+    "tmax": 0.6,
+    "baseline": null,
+    "amp_reject_uv": 150.0,
+    "rr_z_reject": 3.5
+  },
+  "export": {
+    "fif": true,
+    "eeglab": false
+  },
+  "hrv": {
+    "compute": true,
+    "time_domain": true,
+    "frequency_domain": true,
+    "nonlinear": false
+  },
+  "spirometry": {
+    "channel": ""
+  },
+  "stim_keep": [],
+  "flip_flags": false,
+  "preprocessing_tuning": {
+    "pyprep_channel_wise": false,
+    "pyprep_max_chunk_size": 8,
+    "pyprep_by_segment": true,
+    "pyprep_safe_quantile_patch": true,
+    "ica_fit_hz": 100.0,
+    "iclabel_backend": "auto"
+  },
+  "auto_qrs": {
+    "alpha": 0.05,
+    "iterations": 2,
+    "min_corr": 0.8,
+    "corr_search_s": 0.35
+  },
+  "rpeak_recovery": {
+    "iterations": 2,
+    "max_multiple": 4,
+    "promac_threshold": 0.33,
+    "min_template_corr": 0.8
+  },
+  "seeds": {
+    "heppy_random_state": 42,
+    "pythonhashseed": "0",
+    "native_threads": 1
+  },
+  "qc_rule": {
+    "rule_id": "heppy_recording_exclusion_v2",
+    "description": "Pre-specified, group-blind, outcome-blind; evaluated identically on every recording from QC evidence only (diagnostic labels are never read by the HEPPy stage). Two scopes. RECORDING scope: the whole recording is excluded. SEGMENT scope: only keyfile segments in segment.scope_segments (II and preictal, the segments the registered analysis uses) are evaluated; such a segment is excluded if ANY PyPREP chunk overlapping its time range has a status in pyprep_exclude_statuses or interpolated more than max_interpolated_fraction of its EEG channels. PyPREP chunks that overlap only ictal/postictal/transictal segments never exclude anything. A participant left without a usable II segment is handled downstream (reference minimum), not here.",
+    "recording": {
+      "min_eeg_channels_after_montage": 15,
+      "require_ecg_channel": true,
+      "min_valid_ecg_60s_windows": 1,
+      "exclude_on_unhandled_exception": true
+    },
+    "segment": {
+      "scope_segments": [
+        "II",
+        "preictal"
+      ],
+      "pyprep_exclude_statuses": [
+        "skipped_toomanybad",
+        "skipped_no_montage",
+        "failed"
+      ],
+      "pyprep_flag_only_statuses": [
+        "ransac_fallback"
+      ],
+      "max_interpolated_fraction": 0.3,
+      "chunk_overlap": "any chunk with positive-length time overlap with the segment"
+    },
+    "reason_precedence": [
+      "unhandled_exception",
+      "worker_crash",
+      "missing_outputs",
+      "too_few_eeg_channels",
+      "no_ecg_channel",
+      "ecg_no_valid_window",
+      "segment_pyprep_skipped_toomanybad",
+      "segment_pyprep_skipped_no_montage",
+      "segment_pyprep_failed",
+      "segment_excess_interpolation"
+    ]
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "schema": "fsms-config/v1",
+  "name": "tueg_synthetic_fixture",
+  "kind": "fixture",
+  "_note": "SOFTWARE FIXTURE ONLY. Real Temple University EEG (TUEG) recordings with SYNTHETIC diagnostic labels, onset times and semiology; results are meaningless scientifically and exist only to prove the pipeline runs end to end and idempotently. All paths are guarded against the restricted real-study storage.",
+  "paths": {
+    "data_root": "F:/FS_MS_fixture_tueg",
+    "run_root": "F:/FS_MS_fixture_tueg"
+  },
+  "clips": {
+    "mode": "adopt",
+    "dir": "clips",
+    "database": "analysis_database.csv",
+    "snip_keyfile": "clips/snip_keyfile.csv"
+  },
+  "heppy": {
+    "options": "config/heppy_options_fixture.json",
+    "workers": 3,
+    "adopt_existing": false
+  },
+  "manifest": {
+    "format": "mat",
+    "montage": "standard_1020",
+    "min_duration_s": 10,
+    "conditions": ["II", "preict"]
+  },
+  "microstates": {
+    "K": 6,
+    "labelling_rule": "template_prespecified_v2",
+    "classes": ["A", "B", "C", "E", "F", "G"],
+    "min_label_abs_r": 0.5
+  },
+  "analysis": {
+    "prior_strength": 10,
+    "max_autonomic_gap_s": 5.0,
+    "registration_id_placeholder": "https://osf.io/fixture-not-a-registration"
+  }
+}

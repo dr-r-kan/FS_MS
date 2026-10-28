@@ -11,14 +11,12 @@ from pathlib import Path
 import re
 import warnings
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.special import expit
 
 import analyse_ace_cardioneural as ace
+import analyse_transition_priorities as priorities
 from analyse_bayesian_statewise import effective_sample_size, split_rhat
 from analyse_candia_autonomic import native_indices
 import analyse_statewise_transition_recovery as statewise
@@ -30,9 +28,8 @@ ALL_STATES = ("F", "E", "G", "B", "A", "C")
 STATE_REFERENCE_MIN_CORRELATION = 0.50
 FUNCTIONAL = ("FS functional", "DD functional")
 EPILEPTIC = ("ES epileptic", "DD epileptic")
-GROUP_COLORS = {"FS hyper": "#D55E00", "FS hypo": "#0072B2", "ES hyper": "#E69F00", "ES hypo": "#56B4E9"}
-ECG_CACHE_SCHEMA = "continuous-source-native-v2"
-ANALYSIS_SCHEMA = "focused-c-reference-050-v3"
+ECG_CACHE_SCHEMA = "continuous-source-native-v4"
+ANALYSIS_SCHEMA = "focused-c-reference-050-v6"
 
 
 def inv_gamma(rng: np.random.Generator, shape: float, scale: float) -> float:
@@ -253,8 +250,9 @@ def read_ecg(manifest: pd.DataFrame, ecg_dir: Path, original_ecg_dir: Path, data
             interval_recovered = flags[:-1] | flags[1:]
             valid = np.isfinite(rr) & (rr >= 60 / 140) & (rr <= 60 / 35) & ~interval_recovered
             phase = str(row.condition).lower(); phase = "ictal" if phase == "transictal" else phase
-            if phase in ("preict", "ictal"):
-                window = valid & ((midpoint >= duration - 60) if phase == "preict" else (midpoint < 60))
+            if phase in ("ii", "preict", "ictal"):
+                window = valid & ((midpoint >= duration - 60) if phase == "preict" else
+                                  ((midpoint < 60) if phase == "ictal" else np.ones(len(midpoint), bool)))
                 if window.sum() >= 20 and np.ptp(midpoint[window]) >= 40:
                     mean_hr = 60 * window.sum() / rr[window].sum()
                     hr_rows.append({"participant": row.participant, "file_path": row.file_path, "condition": row.condition,
@@ -281,31 +279,80 @@ def read_ecg(manifest: pd.DataFrame, ecg_dir: Path, original_ecg_dir: Path, data
     native = pd.concat(native_rows, ignore_index=True); hr = pd.DataFrame(hr_rows); qc = pd.DataFrame(qc_rows)
     native.to_csv(native_path, index=False, compression="gzip"); hr.to_csv(hr_path, index=False, compression="gzip"); qc.to_csv(qc_path, index=False)
     schema_path.write_text(json.dumps({"schema": ECG_CACHE_SCHEMA,
-                                      "native_method": "full source-record RR train; complete windows cropped to segment"}, indent=2),
+                                      "native_method": "full source-record RR train; complete windows cropped to segment",
+                                      "dense_hr_periods": ["ii", "preict", "ictal"]}, indent=2),
                            encoding="utf-8")
     return native, hr, qc
 
 
 def standardise_autonomic_to_ii(native: pd.DataFrame) -> pd.DataFrame:
     out = native.copy(); baseline = out[out.condition.eq("ii")].groupby("participant", observed=True)
-    for index in ("csi", "cpi"):
+    for index in ("csi", "cpi", "mean_rr_s", "mean_hr_bpm", "rr_first_difference_s",
+                  "rr_acceleration_s", "rmssd_s"):
         mean = baseline[index].mean(); sd = baseline[index].std()
         out[f"{index}_ii_mean"] = out.participant.map(mean); out[f"{index}_ii_sd"] = out.participant.map(sd)
         out[f"{index}_z"] = (out[index] - out[f"{index}_ii_mean"]) / out[f"{index}_ii_sd"].where(out[f"{index}_ii_sd"].gt(0))
+    out["rr_surprise"] = np.nan
+    for participant, part in out.groupby("participant", observed=True):
+        part = part.sort_values(["file_path", "event_time_s"])
+        lag1 = part.groupby("file_path", observed=True).mean_rr_s.shift(1)
+        lag2 = part.groupby("file_path", observed=True).mean_rr_s.shift(2)
+        design = np.column_stack([np.ones(len(part)), lag1, lag2])
+        eligible = part.condition.eq("ii").to_numpy() & np.isfinite(design).all(axis=1)
+        if eligible.sum() < 30:
+            continue
+        beta = np.linalg.lstsq(design[eligible], part.mean_rr_s.to_numpy(float)[eligible], rcond=None)[0]
+        residual = part.mean_rr_s.to_numpy(float) - design @ beta
+        variance = np.var(residual[eligible], ddof=3)
+        if not np.isfinite(variance) or variance <= 0:
+            continue
+        out.loc[part.index, "rr_surprise"] = .5 * np.log(2 * np.pi * variance) + residual ** 2 / (2 * variance)
+    baseline = out[out.condition.eq("ii")].groupby("participant", observed=True)
+    mean, sd = baseline.rr_surprise.mean(), baseline.rr_surprise.std()
+    out["rr_surprise_z"] = ((out.rr_surprise - out.participant.map(mean)) /
+                            out.participant.map(sd).where(out.participant.map(sd).gt(0)))
     return out
 
 
-def simple_hr(hr: pd.DataFrame, manifest: pd.DataFrame, data_dir: Path, figure_dir: Path, args) -> tuple[pd.DataFrame, pd.DataFrame]:
-    frame = add_event_metadata(hr, manifest)
-    frame = frame[frame.event_type.isin(("functional", "epileptic")) & frame.semiology.notna()].copy()
-    frame["is_ictal"] = frame.phase.eq("ictal").astype(int)
-    rows = descriptive_cell_summaries(frame, "mean_hr_bpm", "dense RR HR cell mean", args, prior_var=10000)
+def simple_hr(hr: pd.DataFrame, manifest: pd.DataFrame, data_dir: Path, args) -> tuple[pd.DataFrame, pd.DataFrame]:
+    event = add_event_metadata(hr[~hr.phase.eq("ii")], manifest)
+    event = event[event.event_type.isin(("functional", "epileptic")) & event.semiology.notna()].copy()
+    group = ["participant", "event_type", "semiology", "is_functional", "is_hypo", "is_dd", "phase"]
+    event = event.groupby(group, observed=True).mean_hr_bpm.mean().reset_index()
+
+    cells = manifest[(manifest.condition.astype(str).str.lower().eq("preict")) &
+                     manifest.stratum.isin(FUNCTIONAL + EPILEPTIC) & manifest.semiology.notna()][
+        ["participant", "stratum", "semiology"]].drop_duplicates()
+    cells["event_type"] = np.where(cells.stratum.isin(FUNCTIONAL), "functional", "epileptic")
+    cells["is_functional"] = cells.event_type.eq("functional").astype(int)
+    cells["is_hypo"] = cells.semiology.eq("hypo").astype(int)
+    cells["is_dd"] = cells.stratum.astype(str).str.startswith("DD").astype(int)
+    interictal = (hr[hr.phase.eq("ii")].groupby(["participant", "file_path"], observed=True)
+                  .mean_hr_bpm.mean().groupby("participant").mean().rename("mean_hr_bpm").reset_index()
+                  .merge(cells.drop(columns="stratum"), on="participant", how="inner"))
+    interictal["phase"] = "ii"
+    participant = pd.concat([interictal[group + ["mean_hr_bpm"]], event], ignore_index=True)
+    participant.to_csv(data_dir / "hr_participant_period_cells.csv", index=False)
+
+    rows = []
+    periods = (("ii", "interictal"), ("preict", "preictal"), ("ictal", "ictal"))
+    for functional in (0, 1):
+        for hypo in (0, 1):
+            for period, period_label in periods:
+                part = participant[(participant.is_functional.eq(functional)) &
+                                   (participant.is_hypo.eq(hypo)) & participant.phase.eq(period)].copy()
+                part["is_dd_centered"] = part.is_dd - part.is_dd.mean()
+                label = f"{'FS' if functional else 'ES'} {'hypo' if hypo else 'hyper'} {period_label}"
+                model = fit_conjugate(part, "mean_hr_bpm", ["is_dd_centered"],
+                                      f"dense RR HR cell mean: {label}", args, prior_var=10000)
+                rows.append(contrast(model, {"Intercept": 1}, label) |
+                            {"group": "FS" if functional else "ES", "semiology": "hypo" if hypo else "hyper",
+                             "period": period_label})
     summary = pd.DataFrame(rows); summary.to_csv(data_dir / "hr_bayesian_cells.csv", index=False)
-    plot_cells(summary, figure_dir / "dense_rr_hr.png", "Dense RR-derived heart rate", "Mean HR (bpm)")
-    return frame, summary
+    return participant, summary
 
 
-def simple_coverage(results_dir: Path, manifest: pd.DataFrame, data_dir: Path, figure_dir: Path, args) -> tuple[pd.DataFrame, pd.DataFrame]:
+def simple_coverage(results_dir: Path, manifest: pd.DataFrame, data_dir: Path, args) -> tuple[pd.DataFrame, pd.DataFrame]:
     frame = pd.read_csv(results_dir / "participant_condition_state_backfit_metrics.csv")
     frame = frame[frame.backfit_method.eq("hard") & frame.condition.astype(str).str.lower().isin(("preict", "transictal"))]
     frame = add_event_metadata(frame, manifest)
@@ -320,36 +367,101 @@ def simple_coverage(results_dir: Path, manifest: pd.DataFrame, data_dir: Path, f
         for result in rows:
             result["microstate"] = state; summaries.append(result)
     summary = pd.DataFrame(summaries); summary.to_csv(data_dir / "coverage_bayesian_cells.csv", index=False)
-    plot_coverage(summary, figure_dir / "microstate_coverage.png")
     return frame, summary
 
 
-def autonomic_trends(native: pd.DataFrame, manifest: pd.DataFrame, data_dir: Path, figure_dir: Path, args) -> tuple[pd.DataFrame, pd.DataFrame]:
-    frame = add_event_metadata(native, manifest)
-    preict = frame.condition.eq("preict"); ictal = frame.condition.eq("transictal")
-    frame["relative_s"] = np.where(preict, frame.event_time_s - frame.record_duration_s, frame.event_time_s)
-    frame = frame[(preict & frame.relative_s.between(-60, 0)) | (ictal & frame.relative_s.between(0, 60))]
-    frame = frame[frame.event_type.isin(("functional", "epileptic")) & frame.semiology.notna()].copy()
-    frame["phase"] = np.where(frame.relative_s < 0, "preict", "ictal")
-    rows = []
-    for keys, part in frame.groupby(["participant", "event_key", "file_path", "event_type", "semiology", "is_functional", "is_hypo", "is_dd", "phase"], observed=True):
-        if len(part) < 20 or part.relative_s.max() - part.relative_s.min() < 30: continue
-        row = dict(zip(["participant", "event_key", "file_path", "event_type", "semiology", "is_functional", "is_hypo", "is_dd", "phase"], keys))
-        time = part.relative_s.to_numpy(float) / 60
-        for index in ("csi", "cpi"):
-            value = part[f"{index}_z"].to_numpy(float); good = np.isfinite(time) & np.isfinite(value)
-            row[f"{index}_slope"] = np.polyfit(time[good], value[good], 1)[0] if good.sum() >= 20 else np.nan
-        rows.append(row)
-    slopes = pd.DataFrame(rows); slopes["is_ictal"] = slopes.phase.eq("ictal").astype(int)
-    summaries = []
+def autonomic_trends(native: pd.DataFrame, manifest: pd.DataFrame, data_dir: Path, args) -> tuple[pd.DataFrame, pd.DataFrame]:
+    values = ["csi", "cpi"]
+    preictal = add_event_metadata(native[native.condition.eq("preict")], manifest)
+    preictal["relative_s"] = preictal.event_time_s - preictal.record_duration_s
+    preictal = preictal[preictal.relative_s.between(-60, 0) &
+                        preictal.event_type.isin(("functional", "epileptic")) & preictal.semiology.notna()]
+    event_group = ["participant", "event_key", "event_type", "semiology", "is_functional", "is_hypo", "is_dd"]
+    preictal = preictal.groupby(event_group, observed=True)[values].mean().reset_index()
+    cell_group = ["participant", "event_type", "semiology", "is_functional", "is_hypo", "is_dd"]
+    preictal = preictal.groupby(cell_group, observed=True)[values].mean().reset_index()
+    preictal["period"] = "preictal"
+
+    cells = manifest[(manifest.condition.astype(str).str.lower().eq("preict")) &
+                     manifest.stratum.isin(FUNCTIONAL + EPILEPTIC) & manifest.semiology.notna()][
+        ["participant", "stratum", "semiology"]].drop_duplicates()
+    cells["event_type"] = np.where(cells.stratum.isin(FUNCTIONAL), "functional", "epileptic")
+    cells["is_functional"] = cells.event_type.eq("functional").astype(int)
+    cells["is_hypo"] = cells.semiology.eq("hypo").astype(int)
+    cells["is_dd"] = cells.stratum.astype(str).str.startswith("DD").astype(int)
+    interictal = (native[native.condition.eq("ii")].groupby(["participant", "file_path"], observed=True)[values].mean()
+                  .groupby("participant").mean().reset_index()
+                  .merge(cells.drop(columns="stratum"), on="participant", how="inner"))
+    interictal["period"] = "interictal"
+
+    participant = pd.concat([interictal[cell_group + ["period", *values]],
+                             preictal[cell_group + ["period", *values]]], ignore_index=True)
+    matched = (participant.groupby(["participant", "event_type", "semiology"], observed=True).period.nunique()
+               .loc[lambda count: count.eq(2)].rename("matched").reset_index())
+    participant = participant.merge(matched, on=["participant", "event_type", "semiology"], how="inner").drop(columns="matched")
+    participant.to_csv(data_dir / "autonomic_level_participant_cells.csv", index=False)
+
+    participant["is_preictal"] = participant.period.eq("preictal").astype(int)
+    participant["is_dd_centered"] = participant.is_dd - participant.is_dd.mean()
     for index in ("csi", "cpi"):
-        rows = descriptive_cell_summaries(slopes, f"{index}_slope", f"{index.upper()} last-minute slope cell mean",
-                                          args, prior_var=25)
-        for result in rows:
-            result["index"] = index.upper(); summaries.append(result)
-    summary = pd.DataFrame(summaries); summary.to_csv(data_dir / "autonomic_slope_bayesian_cells.csv", index=False)
-    plot_autonomic(frame, summary, figure_dir / "robust_autonomic_last_minute.png")
-    return slopes, summary
+        participant[f"log_{index}"] = np.log(participant[index].where(participant[index].gt(0)))
+    cell_names = {}
+    for functional in (0, 1):
+        for hypo in (0, 1):
+            for preict in (0, 1):
+                name = f"cell_{functional}_{hypo}_{preict}"; cell_names[(functional, hypo, preict)] = name
+                participant[name] = (participant.is_functional.eq(functional) & participant.is_hypo.eq(hypo) &
+                                     participant.is_preictal.eq(preict)).astype(int)
+
+    def weights(coefficient) -> dict[str, float]:
+        return {name: float(coefficient(*key)) for key, name in cell_names.items() if coefficient(*key)}
+
+    contrast_specs = (
+        ("FS minus ES (marginal)", lambda f, h, p: (1 if f else -1) / 4),
+        ("Hypomotor minus hypermotor (marginal)", lambda f, h, p: (1 if h else -1) / 4),
+        ("Preictal minus interictal (marginal)", lambda f, h, p: (1 if p else -1) / 4),
+        ("FS-ES difference in preictal change", lambda f, h, p: (1 if f == p else -1) / 2),
+        ("Hypo-hyper difference in preictal change", lambda f, h, p: (1 if h == p else -1) / 2),
+        ("Group by semiology interaction", lambda f, h, p: (1 if f == h else -1) / 2),
+        ("Group by semiology by period interaction", lambda f, h, p: 1 if (f + h + p) % 2 else -1),
+    )
+    cell_rows, contrast_rows = [], []
+    for index in ("csi", "cpi"):
+        model = fit_bayes(participant, f"log_{index}", [*cell_names.values(), "is_dd_centered"],
+                          f"{index.upper()} autonomic group semiology period levels", data_dir, args,
+                          intercept=False, event_column=None, prior_var=25)
+        for (functional, hypo, preict), name in cell_names.items():
+            period = "preictal" if preict else "interictal"
+            label = f"{'FS' if functional else 'ES'} {'hypo' if hypo else 'hyper'} {period}"
+            cell = participant[(participant.is_functional.eq(functional)) &
+                               (participant.is_hypo.eq(hypo)) & participant.is_preictal.eq(preict)]
+            cell_rows.append(contrast(model, {name: 1}, label, transform=np.exp) |
+                             {"index": index.upper(), "group": "FS" if functional else "ES",
+                               "semiology": "hypo" if hypo else "hyper", "period": period,
+                               "n_rows": len(cell), "n_participants": cell.participant.nunique(),
+                               "probability_gt_zero": np.nan, "probability_lt_zero": np.nan})
+        for label, coefficient in contrast_specs:
+            result = contrast(model, weights(coefficient), label) | {"index": index.upper()}
+            result |= {"ratio_median": math.exp(result["median"]),
+                       "ratio_ci95_low": math.exp(result["ci95_low"]),
+                       "ratio_ci95_high": math.exp(result["ci95_high"])}
+            contrast_rows.append(result)
+        for functional in (0, 1):
+            for hypo in (0, 1):
+                label = f"{'FS' if functional else 'ES'} {'hypo' if hypo else 'hyper'}: preictal minus interictal"
+                cell = participant[(participant.is_functional.eq(functional)) & participant.is_hypo.eq(hypo)]
+                result = (contrast(model, {cell_names[(functional, hypo, 1)]: 1,
+                                           cell_names[(functional, hypo, 0)]: -1}, label) |
+                          {"index": index.upper(), "n_rows": len(cell),
+                           "n_participants": cell.participant.nunique()})
+                result |= {"ratio_median": math.exp(result["median"]),
+                           "ratio_ci95_low": math.exp(result["ci95_low"]),
+                           "ratio_ci95_high": math.exp(result["ci95_high"])}
+                contrast_rows.append(result)
+    cells_summary, contrasts = pd.DataFrame(cell_rows), pd.DataFrame(contrast_rows)
+    cells_summary.to_csv(data_dir / "autonomic_level_bayesian_cells.csv", index=False)
+    contrasts.to_csv(data_dir / "autonomic_level_bayesian_contrasts.csv", index=False)
+    return participant, contrasts
 
 
 def transition_data(results_dir: Path, manifest: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -369,7 +481,28 @@ def state_reference_qc(results_dir: Path) -> pd.DataFrame:
     return qc
 
 
-def main_transition_models(windows: pd.DataFrame, data_dir: Path, figure_dir: Path, args) -> tuple[pd.DataFrame, dict]:
+def dd_transition_pairs(frame: pd.DataFrame) -> pd.DataFrame:
+    dd = frame[frame.stratum.str.startswith("DD")].copy()
+    dd["event_type"] = np.where(dd.is_functional.eq(1), "functional", "epileptic")
+    counts = dd.groupby(["participant", "event_type"], observed=True).size().unstack(fill_value=0)
+    counts = counts.reindex(columns=["epileptic", "functional"], fill_value=0)
+    counts = counts[counts.gt(0).all(axis=1)]
+    means = (dd.groupby(["participant", "event_type"], observed=True)
+             [["js_from_II", "log_js", "kappa", "log_kappa", "is_hypo_raw", "log_transitions"]]
+             .mean().unstack("event_type").reindex(counts.index))
+    pairs = pd.DataFrame({"participant": counts.index,
+                          "n_epileptic_events": counts.epileptic.to_numpy(int),
+                          "n_functional_events": counts.functional.to_numpy(int)})
+    for source, name in (("js_from_II", "js"), ("log_js", "log_js"),
+                         ("kappa", "kappa"), ("log_kappa", "log_kappa"),
+                         ("is_hypo_raw", "hypo_fraction"), ("log_transitions", "log_transitions")):
+        pairs[f"{name}_epileptic"] = means[(source, "epileptic")].to_numpy(float)
+        pairs[f"{name}_functional"] = means[(source, "functional")].to_numpy(float)
+        pairs[f"{name}_fs_minus_es"] = pairs[f"{name}_functional"] - pairs[f"{name}_epileptic"]
+    return pairs
+
+
+def main_transition_models(windows: pd.DataFrame, data_dir: Path, args) -> tuple[pd.DataFrame, dict]:
     frame = windows[windows.window_end_to_ictus_s.eq(0) & windows.semiology.notna()].copy()
     frame["is_functional"] = frame.stratum.isin(FUNCTIONAL).astype(int); frame["is_hypo_raw"] = frame.semiology.eq("hypo").astype(float)
     frame["is_hypo"] = frame.is_hypo_raw - frame.is_hypo_raw.mean(); frame["is_dd"] = frame.stratum.str.startswith("DD").astype(float)
@@ -385,16 +518,51 @@ def main_transition_models(windows: pd.DataFrame, data_dir: Path, figure_dir: Pa
         rows.append(contrast(model, {"is_hypo": 1, "functional_x_hypo": 1}, "Hypomotor minus hypermotor within FS"))
     summary = pd.DataFrame(rows); summary["outcome"] = ["JS", "JS", "kappa", "kappa"]
     summary.to_csv(data_dir / "c_origin_primary_bayesian.csv", index=False)
-    plot_main_transition(summary, figure_dir / "c_origin_primary.png")
+
+    non_dd = frame[~frame.stratum.str.startswith("DD")].copy()
+    non_dd["is_hypo"] = non_dd.is_hypo_raw - non_dd.is_hypo_raw.mean()
+    non_dd["functional_x_hypo"] = non_dd.is_functional * non_dd.is_hypo
+    non_dd["log_transitions"] = np.log(non_dd.outgoing_transitions.clip(lower=1))
+    non_dd["log_transitions"] -= non_dd.log_transitions.mean()
+    pairs = dd_transition_pairs(frame)
+    for covariate in ("hypo_fraction", "log_transitions"):
+        delta = f"{covariate}_fs_minus_es"
+        pairs[f"{delta}_centered"] = pairs[delta] - pairs[delta].mean()
+    pairs.to_csv(data_dir / "c_origin_dd_paired_values.csv", index=False)
+    subsidiary_rows = []
+    for outcome, label in (("log_js", "JS"), ("log_kappa", "kappa")):
+        model = fit_bayes(non_dd, outcome, ["is_functional", "is_hypo", "functional_x_hypo", "log_transitions"],
+                          f"C-origin {outcome} FS ES excluding DD", data_dir, args,
+                          event_column=None, prior_var=16)
+        models[f"{outcome}_non_dd"] = model
+        subsidiary_rows.append(contrast(model, {"is_functional": 1}, "FS minus ES excluding DD") | {"outcome": label})
+        difference = f"{outcome}_fs_minus_es"
+        paired = pairs.dropna(subset=[difference])
+        model = fit_conjugate(paired, difference,
+                              ["hypo_fraction_fs_minus_es_centered", "log_transitions_fs_minus_es_centered"],
+                              f"C-origin {outcome} DD paired FS ES", args, prior_var=16)
+        models[f"{outcome}_dd_paired"] = model
+        subsidiary_rows.append(contrast(model, {"Intercept": 1}, "FS minus ES within DD (paired)") | {"outcome": label})
+    subsidiary = pd.DataFrame(subsidiary_rows)
+    subsidiary["ratio_median"] = np.exp(subsidiary["median"])
+    subsidiary["ratio_ci95_low"] = np.exp(subsidiary.ci95_low)
+    subsidiary["ratio_ci95_high"] = np.exp(subsidiary.ci95_high)
+    subsidiary.to_csv(data_dir / "c_origin_subsidiary_bayesian.csv", index=False)
     return frame, models
 
 
-def recovery_model(late: pd.DataFrame, post: pd.DataFrame, manifest: pd.DataFrame, data_dir: Path, figure_dir: Path, args) -> pd.DataFrame:
+def recovery_pairs(late: pd.DataFrame, post: pd.DataFrame, manifest: pd.DataFrame) -> pd.DataFrame:
     pre = add_event_metadata(late, manifest); after = add_event_metadata(post, manifest)
     keys = ["participant", "event_key", "semiology", "is_hypo", "is_dd"]
     pre = pre[pre.event_type.eq("functional")].groupby(keys, observed=True).js_from_II.mean().rename("pre_js").reset_index()
     after = after[after.event_type.eq("functional")].groupby(keys, observed=True).js_from_II.mean().rename("post_js").reset_index()
     paired = pre.merge(after, on=keys, validate="one_to_one"); paired["log_post_pre_js"] = np.log(paired.post_js / paired.pre_js)
+    return paired[np.isfinite(paired[["pre_js", "post_js", "log_post_pre_js"]]).all(axis=1)].copy()
+
+
+def recovery_model(late: pd.DataFrame, post: pd.DataFrame, manifest: pd.DataFrame, data_dir: Path, args) -> pd.DataFrame:
+    paired = recovery_pairs(late, post, manifest)
+    paired.to_csv(data_dir / "c_origin_js_recovery_paired_events.csv", index=False)
     paired["is_hypo_centered"] = paired.is_hypo - paired.is_hypo.mean(); paired["is_dd_centered"] = paired.is_dd - paired.is_dd.mean()
     model = fit_bayes(paired, "log_post_pre_js", ["is_hypo_centered", "is_dd_centered"], "C-origin JS postictal recovery",
                       data_dir, args, event_column=None, prior_var=16)
@@ -403,12 +571,10 @@ def recovery_model(late: pd.DataFrame, post: pd.DataFrame, manifest: pd.DataFram
             contrast(model, {"Intercept": 1, "is_hypo_centered": 1 - paired.is_hypo.mean()}, "Hypomotor postictal minus preictal"),
             contrast(model, {"is_hypo_centered": 1}, "Hypomotor minus hypermotor recovery")]
     summary = pd.DataFrame(rows); summary.to_csv(data_dir / "c_origin_js_recovery.csv", index=False)
-    plot_forest(summary, figure_dir / "c_origin_js_recovery.png", "C-origin JS: postictal correction", "Log postictal/preictal JS")
     return summary
 
 
-def peak_metrics(path: Path, manifest: pd.DataFrame) -> pd.DataFrame:
-    table = add_event_metadata(pd.read_csv(path), manifest)
+def peak_metrics(table: pd.DataFrame) -> pd.DataFrame:
     transitions = [f"t_{i}_{j}" for i in range(1, 7) for j in range(1, 7)]
     baseline = {}
     for participant, part in table[table.condition.eq("ii")].groupby("participant", observed=True):
@@ -420,12 +586,16 @@ def peak_metrics(path: Path, manifest: pd.DataFrame) -> pd.DataFrame:
         counts = np.array([[getattr(row, f"t_{i}_{j}") for j in range(1, 7)] for i in range(1, 7)], float)
         b0, ii_n = baseline[str(row.participant)]; enough = counts[5].sum() >= 5 and ii_n[5] >= 5
         logk = ace.fit_kappa(counts, b0, (5,), 5)[0] if enough else np.nan
+        p = (counts[5, :5] + .5) / (counts[5, :5].sum() + 2.5)
+        q = b0[5, :5] / b0[5, :5].sum()
+        logodds = {f"c_logodds_{ALL_STATES[index]}": math.log((p[index] / p[4]) / (q[index] / q[4]))
+                   for index in range(4)} if enough else {f"c_logodds_{ALL_STATES[index]}": np.nan for index in range(4)}
         rows.append({"participant": row.participant, "file_path": row.file_path, "event_key": row.event_key,
                      "condition": row.condition, "event_type": row.event_type, "semiology": row.semiology,
                      "window_index": row.window_index, "window_start_s": row.window_start_s, "window_end_s": row.window_end_s,
                      "window_end_to_ictus_s": row.window_end_to_ictus_s, "c_expression": row.n_C / row.n_gfp_peaks,
                      "c_log_kappa": logk, "c_js": ace.js_divergence(counts, b0, (5,)) if enough else np.nan,
-                     "c_outgoing": counts[5].sum()})
+                     "c_outgoing": counts[5].sum(), **logodds})
     return pd.DataFrame(rows)
 
 
@@ -436,26 +606,36 @@ def common_windows(peaks: pd.DataFrame, native: pd.DataFrame) -> pd.DataFrame:
         if part is None: continue
         use = part[part.event_time_s.between(row.window_start_s, row.window_end_s, inclusive="left")]
         if len(use) < 30 or use.event_time_s.max() - use.event_time_s.min() < 45: continue
-        item = row._asdict(); item.update(csi_z=use.csi_z.mean(), cpi_z=use.cpi_z.mean(), n_native=len(use)); rows.append(item)
+        item = row._asdict()
+        for column in ("csi_z", "cpi_z", "mean_rr_s_z", "mean_hr_bpm_z", "rr_first_difference_s_z",
+                       "rr_acceleration_s_z", "rmssd_s_z", "rr_surprise_z", "mean_hr_bpm"):
+            item[column] = use[column].mean()
+        item["n_native"] = len(use); rows.append(item)
     return pd.DataFrame(rows)
 
 
-def correlation_models(common: pd.DataFrame, functional_participants: set[str], data_dir: Path, figure_dir: Path, args) -> pd.DataFrame:
+def correlation_models(common: pd.DataFrame, functional_participants: set[str], data_dir: Path, args) -> pd.DataFrame:
     frame = common[common.participant.astype(str).isin(functional_participants) & common.condition.isin(("ii", "preict"))].copy()
-    frame["is_preict"] = frame.condition.eq("preict").astype(int); frame["csi_preict"] = frame.csi_z * frame.is_preict
-    frame["cpi_preict"] = frame.cpi_z * frame.is_preict; frame["log_transitions"] = np.log(frame.c_outgoing.clip(lower=1))
+    indices = {"csi_z": "CSI", "cpi_z": "CPI", "mean_rr_s_z": "mean RR",
+               "rr_first_difference_s_z": "RR first difference", "rr_acceleration_s_z": "RR acceleration",
+               "rmssd_s_z": "RMSSD", "rr_surprise_z": "RR surprise"}
+    frame["is_preict"] = frame.condition.eq("preict").astype(int)
+    for index in indices:
+        frame[f"{index}_preict"] = frame[index] * frame.is_preict
+    frame["log_transitions"] = np.log(frame.c_outgoing.clip(lower=1))
     frame["log_transitions"] -= frame.log_transitions.mean(); frame["log_js"] = np.log(frame.c_js.where(frame.c_js.gt(0)))
     frame["is_dd_centered"] = frame.is_dd - frame.is_dd.mean()
     rows = []
     for outcome in ("log_js", "c_log_kappa"):
-        model = fit_bayes(frame, outcome, ["csi_z", "cpi_z", "is_preict", "csi_preict", "cpi_preict", "log_transitions", "is_dd_centered"],
+        predictors = [*indices, "is_preict", *(f"{index}_preict" for index in indices),
+                      "log_transitions", "is_dd_centered"]
+        model = fit_bayes(frame, outcome, predictors,
                           f"FS C-origin {outcome} autonomic association", data_dir, args, prior_var=16)
-        for index in ("csi", "cpi"):
-            rows.append(contrast(model, {f"{index}_z": 1}, f"{index.upper()} association in II") | {"outcome": outcome})
-            rows.append(contrast(model, {f"{index}_z": 1, f"{index}_preict": 1}, f"{index.upper()} association preictally") | {"outcome": outcome})
-            rows.append(contrast(model, {f"{index}_preict": 1}, f"{index.upper()} preictal minus II association") | {"outcome": outcome})
+        for index, label in indices.items():
+            rows.append(contrast(model, {index: 1}, f"{label} association in II") | {"outcome": outcome})
+            rows.append(contrast(model, {index: 1, f"{index}_preict": 1}, f"{label} association preictally") | {"outcome": outcome})
+            rows.append(contrast(model, {f"{index}_preict": 1}, f"{label} preictal minus II association") | {"outcome": outcome})
     summary = pd.DataFrame(rows); summary.to_csv(data_dir / "fs_autonomic_c_origin_correlations.csv", index=False)
-    plot_associations(summary, figure_dir / "fs_autonomic_c_origin_correlations.png")
     return summary
 
 
@@ -476,17 +656,27 @@ def make_lags(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True)
 
 
-def flow_models(common: pd.DataFrame, functional_participants: set[str], data_dir: Path, figure_dir: Path, args) -> pd.DataFrame:
-    variables = ["c_expression", "csi_z", "cpi_z"]
+def flow_models(common: pd.DataFrame, functional_participants: set[str], data_dir: Path, args) -> pd.DataFrame:
+    variables = ["c_expression", "c_js", "c_log_kappa", "csi_z", "cpi_z"]
     frame = within_record_z(common[common.condition.isin(("ii", "preict"))], variables)
     z = [f"{name}_wz" for name in variables]; lagged = make_lags(frame, z)
     rows = []
-    specs = (("autonomic to C", "c_expression_wz", ["c_expression_wz_lag", "csi_z_wz_lag", "cpi_z_wz_lag"], ("csi_z_wz_lag", "cpi_z_wz_lag")),
-             ("C to CSI", "csi_z_wz", ["csi_z_wz_lag", "cpi_z_wz_lag", "c_expression_wz_lag"], ("c_expression_wz_lag",)),
-             ("C to CPI", "cpi_z_wz", ["cpi_z_wz_lag", "csi_z_wz_lag", "c_expression_wz_lag"], ("c_expression_wz_lag",)))
+    specs = (("autonomic to C coverage", "c_expression_wz", ["c_expression_wz_lag", "csi_z_wz_lag", "cpi_z_wz_lag"], ("csi_z_wz_lag", "cpi_z_wz_lag")),
+             ("autonomic to C-origin JS", "c_js_wz", ["c_js_wz_lag", "csi_z_wz_lag", "cpi_z_wz_lag"], ("csi_z_wz_lag", "cpi_z_wz_lag")),
+             ("autonomic to C-origin kappa", "c_log_kappa_wz", ["c_log_kappa_wz_lag", "csi_z_wz_lag", "cpi_z_wz_lag"], ("csi_z_wz_lag", "cpi_z_wz_lag")),
+             ("C coverage to C-origin JS", "c_js_wz", ["c_js_wz_lag", "c_expression_wz_lag"], ("c_expression_wz_lag",)),
+             ("C coverage to C-origin kappa", "c_log_kappa_wz", ["c_log_kappa_wz_lag", "c_expression_wz_lag"], ("c_expression_wz_lag",)),
+             ("C-origin grammar to C coverage", "c_expression_wz", ["c_expression_wz_lag", "c_js_wz_lag", "c_log_kappa_wz_lag"], ("c_js_wz_lag", "c_log_kappa_wz_lag")),
+             ("C coverage to CSI", "csi_z_wz", ["csi_z_wz_lag", "cpi_z_wz_lag", "c_expression_wz_lag"], ("c_expression_wz_lag",)),
+             ("C coverage to CPI", "cpi_z_wz", ["cpi_z_wz_lag", "csi_z_wz_lag", "c_expression_wz_lag"], ("c_expression_wz_lag",)),
+             ("C-origin grammar to CSI", "csi_z_wz", ["csi_z_wz_lag", "cpi_z_wz_lag", "c_js_wz_lag", "c_log_kappa_wz_lag"], ("c_js_wz_lag", "c_log_kappa_wz_lag")),
+             ("C-origin grammar to CPI", "cpi_z_wz", ["cpi_z_wz_lag", "csi_z_wz_lag", "c_js_wz_lag", "c_log_kappa_wz_lag"], ("c_js_wz_lag", "c_log_kappa_wz_lag")))
+    target_labels = {"csi_z_wz_lag": "CSI", "cpi_z_wz_lag": "CPI",
+                     "c_expression_wz_lag": "C coverage", "c_js_wz_lag": "C-origin JS",
+                     "c_log_kappa_wz_lag": "C-origin kappa"}
     for label, outcome, predictors, targets in specs:
         model = fit_bayes(lagged, outcome, predictors, f"all participants flow {label}", data_dir, args, prior_var=9)
-        for target in targets: rows.append(contrast(model, {target: 1}, f"All participants: {label} ({target.split('_')[0]})"))
+        for target in targets: rows.append(contrast(model, {target: 1}, f"All participants: {label} ({target_labels[target]})"))
 
     fs = lagged[lagged.participant.astype(str).isin(functional_participants)].copy()
     fs["is_last_minute"] = (fs.condition.eq("preict") & fs.window_end_to_ictus_s.eq(0)).astype(int)
@@ -497,11 +687,11 @@ def flow_models(common: pd.DataFrame, functional_participants: set[str], data_di
             name = f"last_x_{predictor}"; fs[name] = fs.is_last_minute * fs[predictor]; expanded.append(name)
         model = fit_bayes(fs, outcome, expanded, f"FS II versus last-minute flow {label}", data_dir, args, prior_var=9)
         for target in targets:
-            rows.append(contrast(model, {target: 1}, f"FS II: {label} ({target.split('_')[0]})"))
-            rows.append(contrast(model, {target: 1, f"last_x_{target}": 1}, f"FS last minute: {label} ({target.split('_')[0]})"))
-            rows.append(contrast(model, {f"last_x_{target}": 1}, f"FS last minute minus II: {label} ({target.split('_')[0]})"))
+            target_label = target_labels[target]
+            rows.append(contrast(model, {target: 1}, f"FS II: {label} ({target_label})"))
+            rows.append(contrast(model, {target: 1, f"last_x_{target}": 1}, f"FS last minute: {label} ({target_label})"))
+            rows.append(contrast(model, {f"last_x_{target}": 1}, f"FS last minute minus II: {label} ({target_label})"))
     summary = pd.DataFrame(rows); summary.to_csv(data_dir / "bayesian_predictive_flow.csv", index=False)
-    plot_flow(summary, figure_dir / "bayesian_predictive_flow.png")
     return summary
 
 
@@ -528,219 +718,31 @@ def demographics(manifest: pd.DataFrame, database_path: Path, data_dir: Path) ->
     return summary, events
 
 
-def plot_cells(summary: pd.DataFrame, output: Path, title: str, ylabel: str) -> None:
-    fig, ax = plt.subplots(figsize=(10, 5)); labels = summary.contrast.tolist(); x = np.arange(len(summary)); y = summary["median"].to_numpy(float)
-    ax.errorbar(x, y, yerr=[y - summary.ci95_low, summary.ci95_high - y], fmt="o", capsize=3)
-    ax.set(xticks=x, xticklabels=labels, ylabel=ylabel, title=title); ax.tick_params(axis="x", rotation=45); ax.grid(axis="y", alpha=.2)
-    fig.tight_layout(); fig.savefig(output, dpi=300, bbox_inches="tight"); plt.close(fig)
-
-
-def plot_coverage(summary: pd.DataFrame, output: Path) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6), sharey=True)
-    for ax, phase in zip(axes, ("preictal", "ictal")):
-        exact_phase = summary.contrast.str.rsplit(n=1).str[-1].eq(phase)
-        for state in ALL_STATES:
-            part = summary[(summary.microstate.eq(state)) & exact_phase]
-            x = np.arange(len(part)); ax.errorbar(x, part["median"], yerr=[part["median"]-part.ci95_low, part.ci95_high-part["median"]],
-                                                   marker="o", capsize=2, label=state)
-        labels = summary[exact_phase].contrast.drop_duplicates().str.replace(f" {phase}$", "", regex=True)
-        ax.set(xticks=np.arange(len(labels)), xticklabels=labels, title=phase.title(), ylabel="Coverage", ylim=(0, .45)); ax.tick_params(axis="x", rotation=30)
-    axes[0].legend(frameon=False, ncol=3); fig.suptitle("Microstate coverage by seizure type, semiology and phase (posterior median, 95% CrI)")
-    fig.tight_layout(); fig.savefig(output, dpi=300, bbox_inches="tight"); plt.close(fig)
-
-
-def plot_autonomic(frame: pd.DataFrame, summary: pd.DataFrame, output: Path) -> None:
-    frame = frame.copy(); frame["bin"] = (frame.relative_s / 5).round() * 5
-    frame["label"] = frame.event_type.map({"functional": "FS", "epileptic": "ES"}) + " " + frame.semiology
-    event = frame.groupby(["participant", "event_key", "label", "bin"], observed=True)[["csi_z", "cpi_z"]].mean().reset_index()
-    participant = event.groupby(["participant", "label", "bin"], observed=True)[["csi_z", "cpi_z"]].mean().reset_index()
-    fig, axes = plt.subplots(2, 2, figsize=(16, 9))
-    for row, index in enumerate(("csi", "cpi")):
-        ax = axes[row, 0]
-        for label, color in GROUP_COLORS.items():
-            part = participant[participant.label.eq(label)]; line = part.groupby("bin", observed=True)[f"{index}_z"].agg(["mean", "sem"]).reset_index()
-            for phase_number, phase_mask in enumerate((line["bin"].lt(0), line["bin"].ge(0))):
-                phase = line[phase_mask]
-                time = phase["bin"].to_numpy(float); mean = phase["mean"].to_numpy(float); sem = phase["sem"].to_numpy(float)
-                ax.plot(time, mean, color=color, label=label if phase_number == 0 else None)
-                ax.fill_between(time, mean-sem, mean+sem, color=color, alpha=.12)
-        ax.axvline(0, color="black", lw=1); ax.axhline(0, color=".6", lw=1); ax.set(ylabel=f"{index.upper()} (participant II SD)")
-        part = summary[summary["index"].eq(index.upper())]; y = np.arange(len(part)); value = part["median"].to_numpy(float)
-        axes[row, 1].errorbar(value, y, xerr=[value-part.ci95_low, part.ci95_high-value], fmt="o", capsize=3)
-        axes[row, 1].axvline(0, color=".5", lw=1); axes[row, 1].set(yticks=y, yticklabels=part.contrast,
-            xlabel=f"{index.upper()} slope (II SD/min)", title="Posterior slope, 95% CrI"); axes[row, 1].invert_yaxis()
-    axes[0, 0].legend(frameon=False, ncol=2); axes[-1, 0].set(xlabel="Seconds from seizure onset")
-    fig.suptitle("Robust 15-second autonomic estimates (5-second display bins): final preictal and first ictal minute")
-    fig.tight_layout(); fig.savefig(output, dpi=300, bbox_inches="tight"); plt.close(fig)
-
-
-def plot_main_transition(summary: pd.DataFrame, output: Path) -> None:
-    plot_forest(summary, output, "C-origin transition divergence and precision", "Posterior log effect")
-
-
-def plot_forest(summary: pd.DataFrame, output: Path, title: str, xlabel: str) -> None:
-    fig, ax = plt.subplots(figsize=(10, max(4, .6 * len(summary)))); y = np.arange(len(summary)); x = summary["median"].to_numpy(float)
-    labels = [f"{getattr(row, 'outcome', '')} {row.contrast}\nP(>0)={row.probability_gt_zero:.3f}" for row in summary.itertuples()]
-    ax.errorbar(x, y, xerr=[x-summary.ci95_low, summary.ci95_high-x], fmt="o", capsize=3); ax.axvline(0, color=".5", lw=1)
-    ax.set(yticks=y, yticklabels=labels, xlabel=xlabel, title=title); ax.invert_yaxis(); ax.grid(axis="x", alpha=.2)
-    fig.tight_layout(); fig.savefig(output, dpi=300, bbox_inches="tight"); plt.close(fig)
-
-
-def plot_associations(summary: pd.DataFrame, output: Path) -> None:
-    plot_forest(summary[~summary.contrast.str.contains("minus")], output, "Within-FS autonomic associations with C-origin transitions", "Posterior regression coefficient")
-
-
-def plot_flow(summary: pd.DataFrame, output: Path) -> None:
-    plot_forest(summary, output, "Bayesian one-window predictive information flow", "Standardised lag coefficient")
-
-
-def box_with_points(ax, arrays: list[np.ndarray], labels: list[str], colors: list[str]) -> None:
-    boxes = ax.boxplot(arrays, tick_labels=labels, patch_artist=True, showfliers=False)
-    for patch, color in zip(boxes["boxes"], colors):
-        patch.set_facecolor(color); patch.set_alpha(.25)
-    rng = np.random.default_rng(27)
-    for position, (values, color) in enumerate(zip(arrays, colors), 1):
-        ax.scatter(position + rng.uniform(-.12, .12, len(values)), values, color=color, alpha=.45, s=18)
-    ax.grid(axis="y", alpha=.2)
-
-
-def plot_c_origin_boxplots(late: pd.DataFrame, summary: pd.DataFrame, output: Path) -> None:
-    frame = late.copy()
-    frame["group"] = np.select([frame.stratum.isin(FUNCTIONAL), frame.stratum.isin(EPILEPTIC)], ["FS", "ES"], default="")
-    event = (frame[frame.group.ne("")].groupby(["participant", "file_path", "group", "semiology"], observed=True)
-             [["js_from_II", "log_kappa"]].mean().reset_index())
-    overall = event.groupby(["participant", "group"], observed=True)[["js_from_II", "log_kappa"]].mean().reset_index()
-    semio = event[event.group.eq("FS")].groupby(["participant", "semiology"], observed=True)[["js_from_II", "log_kappa"]].mean().reset_index()
-    lookup = {(row.outcome, row.contrast): row for row in summary.itertuples()}
-    panels = [
-        (overall, "group", ("ES", "FS"), "js_from_II", "C-origin JS", ("JS", "FS minus ES"), "FS minus ES"),
-        (overall, "group", ("ES", "FS"), "log_kappa", "C-origin log κ", ("kappa", "FS minus ES"), "FS minus ES"),
-        (semio, "semiology", ("hyper", "hypo"), "js_from_II", "C-origin JS", ("JS", "Hypomotor minus hypermotor within FS"), "Hypomotor minus hypermotor (FS)"),
-        (semio, "semiology", ("hyper", "hypo"), "log_kappa", "C-origin log κ", ("kappa", "Hypomotor minus hypermotor within FS"), "Hypomotor minus hypermotor (FS)")]
-    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
-    for ax, (data, grouping, levels, outcome, ylabel, key, title) in zip(axes.flat, panels):
-        arrays = [data.loc[data[grouping].eq(level), outcome].dropna().to_numpy(float) for level in levels]
-        colors = ["#7A5195", "#009E73"] if grouping == "group" else [GROUP_COLORS["FS hyper"], GROUP_COLORS["FS hypo"]]
-        box_with_points(ax, arrays, [level.upper() if grouping == "group" else level.title() for level in levels], colors)
-        result = lookup[key]
-        ax.set(ylabel=ylabel, title=(f"{title}\nposterior effect={result.median:.3f} "
-                                    f"[{result.ci95_low:.3f}, {result.ci95_high:.3f}]; "
-                                    f"P(>0)={result.probability_gt_zero:.3f}"))
-    fig.suptitle("Final-minute C-origin transition metrics"); fig.tight_layout(); fig.savefig(output, dpi=300, bbox_inches="tight"); plt.close(fig)
-
-
-def plot_js_recovery_boxplots(late: pd.DataFrame, post: pd.DataFrame, manifest: pd.DataFrame,
-                              recovery: pd.DataFrame, output: Path) -> None:
-    pre, after = add_event_metadata(late, manifest), add_event_metadata(post, manifest)
-    keys = ["participant", "event_key", "semiology"]
-    pre = pre[pre.event_type.eq("functional")].groupby(keys, observed=True).js_from_II.mean().rename("pre").reset_index()
-    after = after[after.event_type.eq("functional")].groupby(keys, observed=True).js_from_II.mean().rename("post").reset_index()
-    paired = pre.merge(after, on=keys, validate="one_to_one")
-    overall = paired.groupby("participant", observed=True)[["pre", "post"]].mean().reset_index()
-    semio = paired.groupby(["participant", "semiology"], observed=True)[["pre", "post"]].mean().reset_index()
-    result = {row.contrast: row for row in recovery.itertuples()}
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
-    box_with_points(axes[0], [overall.pre.to_numpy(), overall.post.to_numpy()], ["PreI", "PostI"], ["#CC79A7", "#009E73"])
-    for row in overall.itertuples(): axes[0].plot([1, 2], [row.pre, row.post], color=".5", alpha=.12, lw=.7)
-    overall_result = result["Overall postictal minus preictal"]
-    axes[0].set(ylabel="C-origin JS divergence from interictal baseline",
-                title=(f"All FS\nlog(PostI/PreI)={overall_result.median:.3f} "
-                       f"[{overall_result.ci95_low:.3f}, {overall_result.ci95_high:.3f}]; "
-                       f"P(<0)={overall_result.probability_lt_zero:.3f}"))
-    levels = (("hyper", "pre"), ("hyper", "post"), ("hypo", "pre"), ("hypo", "post"))
-    arrays = [semio.loc[semio.semiology.eq(group), phase].to_numpy(float) for group, phase in levels]
-    box_with_points(axes[1], arrays, ["Hyper\nPreI", "Hyper\nPostI", "Hypo\nPreI", "Hypo\nPostI"],
-                    [GROUP_COLORS["FS hyper"], "#E69F00", GROUP_COLORS["FS hypo"], "#56B4E9"])
-    for group, positions in (("hyper", (1, 2)), ("hypo", (3, 4))):
-        for row in semio[semio.semiology.eq(group)].itertuples(): axes[1].plot(positions, [row.pre, row.post], color=".5", alpha=.12, lw=.7)
-    hyper_result = result["Hypermotor postictal minus preictal"]
-    hypo_result = result["Hypomotor postictal minus preictal"]
-    axes[1].set(title=("FS by semiology: log(PostI/PreI), 95% CrI\n"
-                       f"hyper={hyper_result.median:.3f} [{hyper_result.ci95_low:.3f}, {hyper_result.ci95_high:.3f}]; "
-                       f"hypo={hypo_result.median:.3f} [{hypo_result.ci95_low:.3f}, {hypo_result.ci95_high:.3f}]"))
-    fig.suptitle("Postictal correction of C-origin transition divergence"); fig.tight_layout(); fig.savefig(output, dpi=300, bbox_inches="tight"); plt.close(fig)
-
-
-def fixed_posterior(path: Path) -> tuple[np.ndarray, dict[str, int]]:
-    saved = np.load(path); names = saved["parameter_names"].astype(str).tolist()
-    draws = saved["draws"][..., :len(names)].reshape(-1, len(names))
-    return draws, {name: index for index, name in enumerate(names)}
-
-
-def regression_panel(ax, frame: pd.DataFrame, x_name: str, y_name: str, draws: np.ndarray,
-                     intercept: np.ndarray, slope: np.ndarray, title: str, xlabel: str, ylabel: str) -> None:
-    use = frame[[x_name, y_name]].replace([np.inf, -np.inf], np.nan).dropna()
-    low, high = use[x_name].quantile([.01, .99]); use = use[use[x_name].between(low, high)]
-    shown = use.sample(min(1800, len(use)), random_state=27)
-    ax.scatter(shown[x_name], shown[y_name], color="#4C78A8", alpha=.10, s=10)
-    grid = np.linspace(low, high, 120); prediction = intercept[:, None] + slope[:, None] * grid
-    lo, middle, hi = np.quantile(prediction, [.025, .5, .975], axis=0)
-    beta_low, beta, beta_high = np.quantile(slope, [.025, .5, .975])
-    ax.plot(grid, middle, color="#D55E00", lw=2); ax.fill_between(grid, lo, hi, color="#D55E00", alpha=.2)
-    ax.set(xlabel=xlabel, ylabel=ylabel, title=f"{title}\nβ={beta:.3f} [{beta_low:.3f}, {beta_high:.3f}]"); ax.grid(alpha=.2)
-
-
-def plot_cpi_kappa_regression(common: pd.DataFrame, functional_participants: set[str], data_dir: Path, output: Path) -> None:
-    frame = common[common.participant.astype(str).isin(functional_participants) & common.condition.isin(("ii", "preict"))]
-    draws, names = fixed_posterior(data_dir / "posterior_fs_c_origin_c_log_kappa_autonomic_association.npz")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
-    regression_panel(axes[0], frame[frame.condition.eq("ii")], "cpi_z", "c_log_kappa", draws,
-                     draws[:, names["Intercept"]], draws[:, names["cpi_z"]], "Interictal", "CPI (participant II SD)", "C-origin log κ")
-    regression_panel(axes[1], frame[frame.condition.eq("preict")], "cpi_z", "c_log_kappa", draws,
-                     draws[:, names["Intercept"]] + draws[:, names["is_preict"]],
-                     draws[:, names["cpi_z"]] + draws[:, names["cpi_preict"]], "Preictal", "CPI (participant II SD)", "C-origin log κ")
-    fig.suptitle("Within-FS CPI association with C-origin transition precision\nPosterior line and 95% credible band")
-    fig.tight_layout(); fig.savefig(output, dpi=300, bbox_inches="tight"); plt.close(fig)
-
-
-def plot_csi_to_c_regression(common: pd.DataFrame, functional_participants: set[str], data_dir: Path, output: Path) -> None:
-    variables = ["c_expression", "csi_z", "cpi_z"]
-    lagged = make_lags(within_record_z(common[common.condition.isin(("ii", "preict"))], variables), [f"{name}_wz" for name in variables])
-    frame = lagged[lagged.participant.astype(str).isin(functional_participants)].copy()
-    frame["is_last_minute"] = (frame.condition.eq("preict") & frame.window_end_to_ictus_s.eq(0)).astype(int)
-    frame = frame[frame.condition.eq("ii") | frame.is_last_minute.eq(1)]
-    draws, names = fixed_posterior(data_dir / "posterior_fs_ii_versus_last_minute_flow_autonomic_to_c.npz")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
-    regression_panel(axes[0], frame[frame.condition.eq("ii")], "csi_z_wz_lag", "c_expression_wz", draws,
-                     draws[:, names["Intercept"]], draws[:, names["csi_z_wz_lag"]],
-                     "Interictal", "Previous-window CSI (within-record SD)", "Subsequent C expression (within-record SD)")
-    regression_panel(axes[1], frame[frame.is_last_minute.eq(1)], "csi_z_wz_lag", "c_expression_wz", draws,
-                     draws[:, names["Intercept"]] + draws[:, names["is_last_minute"]],
-                     draws[:, names["csi_z_wz_lag"]] + draws[:, names["last_x_csi_z_wz_lag"]],
-                     "Final preictal minute", "Previous-window CSI (within-record SD)", "Subsequent C expression (within-record SD)")
-    fig.suptitle("Within-FS CSI prediction of subsequent microstate-C expression\nPosterior line and 95% credible band")
-    fig.tight_layout(); fig.savefig(output, dpi=300, bbox_inches="tight"); plt.close(fig)
-
-
-def plot_preictal_kappa_js(windows: pd.DataFrame, data_dir: Path, output: Path) -> pd.DataFrame:
+def prepare_preictal_kappa_js(windows: pd.DataFrame, data_dir: Path) -> pd.DataFrame:
     frame = windows[np.isfinite(windows.log_kappa) & np.isfinite(windows.js_from_II)].copy()
     frame["group"] = np.select([frame.stratum.isin(FUNCTIONAL), frame.stratum.isin(EPILEPTIC)], ["FS", "ES"], default="")
     frame = frame[frame.group.ne("") & frame.semiology.isin(("hyper", "hypo"))]
     event = (frame.groupby(["participant", "file_path", "group", "semiology"], observed=True)
              [["log_kappa", "js_from_II"]].mean().reset_index())
     participant = (event.groupby(["participant", "group", "semiology"], observed=True)
-                   [["log_kappa", "js_from_II"]].mean().reset_index())
+                   .agg(log_kappa=("log_kappa", "mean"), js_from_II=("js_from_II", "mean"),
+                        n_events=("file_path", "nunique")).reset_index())
     participant["kappa"] = np.exp(participant.log_kappa)
     assert participant.groupby(["participant", "group", "semiology"], observed=True).size().max() == 1
+    participant = participant.sort_values(["group", "semiology", "participant"])
     participant.to_csv(data_dir / "preictal_kappa_js_participant.csv", index=False)
 
-    fig, ax = plt.subplots(figsize=(9, 6)); lines = []
-    for label, color in GROUP_COLORS.items():
-        group, semiology = label.split()
-        part = participant[participant.group.eq(group) & participant.semiology.eq(semiology)]
-        if len(part) < 3:
-            continue
-        slope, intercept = np.polyfit(part.log_kappa, part.js_from_II, 1)
-        grid = np.linspace(part.log_kappa.min(), part.log_kappa.max(), 100)
-        ax.scatter(part.kappa, part.js_from_II, color=color, alpha=.45, s=28)
-        ax.plot(np.exp(grid), intercept + slope * grid, color=color, lw=2, label=f"{label} (n={len(part)})")
-        lines.append({"group": group, "semiology": semiology, "n_participants": len(part),
-                      "slope_per_log_kappa": slope, "intercept": intercept,
-                      "pearson_r": np.corrcoef(part.log_kappa, part.js_from_II)[0, 1]})
-    ax.set_xscale("log"); ax.set(xlabel="C-origin κ (log scale)", ylabel="C-origin JS divergence from interictal baseline",
-        title="Preictal C-origin transition precision versus divergence")
-    ax.grid(alpha=.2); ax.legend(frameon=False); fig.tight_layout(); fig.savefig(output, dpi=300, bbox_inches="tight"); plt.close(fig)
-    stats = pd.DataFrame(lines); stats.to_csv(data_dir / "preictal_kappa_js_lines.csv", index=False)
+    rows = []
+    for group in ("FS", "ES"):
+        for semiology in ("hyper", "hypo"):
+            part = participant[participant.group.eq(group) & participant.semiology.eq(semiology)]
+            if len(part) < 3:
+                continue
+            slope, intercept = np.polyfit(part.log_kappa, part.js_from_II, 1)
+            rows.append({"group": group, "semiology": semiology, "n_participants": len(part),
+                         "slope_per_log_kappa": slope, "intercept": intercept,
+                         "pearson_r": np.corrcoef(part.log_kappa, part.js_from_II)[0, 1]})
+    pd.DataFrame(rows).to_csv(data_dir / "preictal_kappa_js_lines.csv", index=False)
     return participant
 
 
@@ -772,18 +774,29 @@ def self_check() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore"); model = fit_bayes(frame, "y", ["x"], "self check", Path.cwd(), Args())
     result = contrast(model, {"x": 1}, "x"); assert result["median"] > .35 and result["probability_gt_zero"] > .98
+    dd = pd.DataFrame([
+        {"participant": "p0", "stratum": "DD epileptic", "is_functional": 0, "js_from_II": .1,
+         "log_js": math.log(.1), "kappa": 1., "log_kappa": 0., "is_hypo_raw": 0., "log_transitions": 1.},
+        {"participant": "p0", "stratum": "DD functional", "is_functional": 1, "js_from_II": .2,
+         "log_js": math.log(.2), "kappa": 2., "log_kappa": math.log(2), "is_hypo_raw": 1., "log_transitions": 2.},
+        {"participant": "p1", "stratum": "DD functional", "is_functional": 1, "js_from_II": .3,
+         "log_js": math.log(.3), "kappa": 1., "log_kappa": 0., "is_hypo_raw": 0., "log_transitions": 1.},
+    ])
+    pairs = dd_transition_pairs(dd)
+    assert pairs.participant.tolist() == ["p0"] and abs(pairs.log_js_fs_minus_es.iloc[0] - math.log(2)) < 1e-12
+    priorities.self_check()
     Path("posterior_self_check.npz").unlink(missing_ok=True)
 
 
 def run(args) -> dict:
-    data_dir, figure_dir = args.out_dir / "data", args.out_dir / "figures"; data_dir.mkdir(parents=True, exist_ok=True); figure_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = args.out_dir / "data"; data_dir.mkdir(parents=True, exist_ok=True)
     manifest = attach_strata(pd.read_csv(args.manifest)); manifest["semiology"] = ace.normalise_semiology(manifest.hypo_hyper)
     native, hr, ecg_qc = read_ecg(manifest, args.ecg_qc_dir, args.original_ecg_qc_dir, data_dir, args.reuse_ecg)
     native = standardise_autonomic_to_ii(native); native.to_csv(data_dir / "autonomic_native_ii_standardised.csv.gz", index=False, compression="gzip")
     demographics_table, event_table = demographics(manifest, args.demographics_csv, data_dir)
-    _, hr_summary = simple_hr(hr, manifest, data_dir, figure_dir, args)
-    _, coverage_summary = simple_coverage(args.results_dir, manifest, data_dir, figure_dir, args)
-    _, autonomic_summary = autonomic_trends(native, manifest, data_dir, figure_dir, args)
+    hr_cells, hr_summary = simple_hr(hr, manifest, data_dir, args)
+    _, coverage_summary = simple_coverage(args.results_dir, manifest, data_dir, args)
+    autonomic_cells, autonomic_summary = autonomic_trends(native, manifest, data_dir, args)
     reference_qc = state_reference_qc(args.results_dir); reference_qc.to_csv(data_dir / "state_reference_qc.csv", index=False)
     valid_c_participants = set(reference_qc.loc[reference_qc.template_label.eq("C") & reference_qc.retained, "participant"].astype(str))
     windows, late, post = transition_data(args.results_dir, manifest)
@@ -791,27 +804,77 @@ def run(args) -> dict:
     late = late[late.participant.astype(str).isin(valid_c_participants)]
     post = post[post.participant.astype(str).isin(valid_c_participants)]
     windows.to_csv(data_dir / "c_origin_preictal_windows.csv", index=False); late.to_csv(data_dir / "c_origin_late_preictal.csv", index=False); post.to_csv(data_dir / "c_origin_postictal.csv", index=False)
-    plot_preictal_kappa_js(windows, data_dir, figure_dir / "preictal_kappa_vs_js.png")
-    _, transition_models = main_transition_models(windows, data_dir, figure_dir, args)
+    prepare_preictal_kappa_js(windows, data_dir)
+    main_transition_models(windows, data_dir, args)
     transition_summary = pd.read_csv(data_dir / "c_origin_primary_bayesian.csv")
-    recovery_summary = recovery_model(late, post, manifest, data_dir, figure_dir, args)
-    plot_c_origin_boxplots(late, transition_summary, figure_dir / "c_origin_final_minute_boxplots.png")
-    plot_js_recovery_boxplots(late, post, manifest, recovery_summary, figure_dir / "c_origin_js_recovery_boxplots.png")
-    peaks = peak_metrics(args.peak_windows_csv, manifest)
+    subsidiary_summary = pd.read_csv(data_dir / "c_origin_subsidiary_bayesian.csv")
+    recovery_summary = recovery_model(late, post, manifest, data_dir, args)
+    peak_table = add_event_metadata(pd.read_csv(args.peak_windows_csv), manifest)
+    peaks = peak_metrics(peak_table)
     peaks = peaks[peaks.participant.astype(str).isin(valid_c_participants)]
     common = common_windows(peaks, native)
     dd_participants = set(manifest.loc[manifest.group.astype(str).str.upper().eq("DD"), "participant"].astype(str))
-    common["is_dd"] = common.participant.astype(str).isin(dd_participants).astype(int)
-    common.to_csv(data_dir / "autonomic_peak_microstate_common_windows.csv.gz", index=False, compression="gzip")
     functional_participants = set(manifest.loc[manifest.stratum.isin(FUNCTIONAL), "participant"].astype(str))
-    association_summary = correlation_models(common, functional_participants, data_dir, figure_dir, args)
-    flow_summary = flow_models(common, functional_participants, data_dir, figure_dir, args)
-    plot_cpi_kappa_regression(common, functional_participants, data_dir, figure_dir / "fs_cpi_kappa_regression.png")
-    plot_csi_to_c_regression(common, functional_participants, data_dir, figure_dir / "fs_csi_to_c_regression.png")
+    common["is_dd"] = common.participant.astype(str).isin(dd_participants).astype(int)
+    common["is_functional_participant"] = common.participant.astype(str).isin(functional_participants).astype(int)
+    common.to_csv(data_dir / "autonomic_peak_microstate_common_windows.csv.gz", index=False, compression="gzip")
+    if args.retained_only:
+        recovery = recovery_summary[recovery_summary.contrast.str.startswith("Overall")].iloc[0]
+        report = [
+            "# Retained clinical and physiological analyses", "",
+            "This intermediate analysis intentionally excludes legacy transition, route, specificity, autonomic-association and pairwise flow models. Those estimands are replaced by the hierarchical multinomial, latent-factor and joint dynamic analyses.", "",
+            "## Cohort and events", "", markdown_table(demographics_table, list(demographics_table.columns)), "",
+            markdown_table(event_table, list(event_table.columns)), "",
+            "## Heart rate", "", markdown_table(hr_summary, ["contrast", "median", "ci95_low", "ci95_high", "n_participants"]), "",
+            "## Microstate coverage", "", markdown_table(coverage_summary, ["microstate", "contrast", "median", "ci95_low", "ci95_high", "n_participants"]), "",
+            "## Autonomic levels", "", markdown_table(autonomic_summary, ["index", "contrast", "median", "ci95_low", "ci95_high", "ratio_median", "ratio_ci95_low", "ratio_ci95_high", "probability_gt_zero", "n_participants"]), "",
+            "## Postictal recovery", "", markdown_table(recovery_summary, ["contrast", "median", "ci95_low", "ci95_high", "probability_lt_zero", "n_participants"]), "",
+            "These retained analyses answer questions not subsumed by the preictal transition model: clinical context, occupancy, autonomic level and postictal recovery.",
+        ]
+        (args.out_dir / "RETAINED_RESULTS.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+        summary = {"participants": int(manifest.participant.nunique()),
+                   "c_reference_valid_participants": len(valid_c_participants),
+                   "ecg_records_valid": int(ecg_qc.autonomic_valid.sum()),
+                   "common_windows": len(common),
+                   "recovery_probability_post_lt_pre": float(recovery.probability_lt_zero),
+                   "replaced_legacy_transition_models_run": False,
+                   "replaced_legacy_flow_models_run": False}
+        (data_dir / "retained_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        (data_dir / "analysis_schema.json").write_text(json.dumps({
+            "schema": "focused-retained-only-v1", "retained": ["demographics", "heart_rate", "coverage", "autonomic_levels", "postictal_recovery"],
+            "replaced": ["legacy_transition_models", "legacy_route_tests", "legacy_specificity_tests", "legacy_autonomic_associations", "legacy_pairwise_flow"],
+            "state_reference_min_abs_correlation": STATE_REFERENCE_MIN_CORRELATION}, indent=2), encoding="utf-8")
+        audit = {"completed_utc": datetime.now(timezone.utc).isoformat(), "mode": "retained-only",
+                 "results_dir": str(args.results_dir), "manifest": str(args.manifest),
+                 "peak_windows_csv": str(args.peak_windows_csv),
+                 "global_labels": list(load_global_labels(args.results_dir)),
+                 "code_sha256": {path.name: file_sha256(path) for path in
+                                  (Path(__file__), Path(__file__).with_name("analyse_candia_autonomic.py"))},
+                 **summary}
+        (args.out_dir / "RETAINED_AUDIT.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+        return summary
+    association_summary = correlation_models(common, functional_participants, data_dir, args)
+    flow_summary = flow_models(common, functional_participants, data_dir, args)
+    feedback_summary = priorities.run(peak_table, reference_qc, common, data_dir, args.transition_draws,
+                                      args.seed + 104729)
+    raw_count_summary = pd.read_csv(data_dir / "raw_count_c_origin_bayesian.csv")
+    specificity_summary = pd.read_csv(data_dir / "all_state_raw_count_specificity_bayesian.csv")
+    route_summary = pd.read_csv(data_dir / "c_origin_route_destination_bayesian.csv")
+    pseudo_summary = pd.read_csv(data_dir / "matched_interictal_pseudo_onset_bayesian.csv")
+    matched_recovery_summary = pd.read_csv(data_dir / "c_origin_recovery_matched_bayesian.csv")
+    trajectory_summary = pd.read_csv(data_dir / "c_origin_preictal_binned_trajectory_bayesian.csv")
 
     main_js = transition_summary[(transition_summary.outcome.eq("JS")) & transition_summary.contrast.eq("FS minus ES")].iloc[0]
     main_kappa = transition_summary[(transition_summary.outcome.eq("kappa")) & transition_summary.contrast.eq("FS minus ES")].iloc[0]
     semio_js = transition_summary[(transition_summary.outcome.eq("JS")) & transition_summary.contrast.str.startswith("Hypomotor")].iloc[0]
+    non_dd_js = subsidiary_summary[(subsidiary_summary.outcome.eq("JS")) &
+                                   subsidiary_summary.contrast.str.contains("excluding DD")].iloc[0]
+    non_dd_kappa = subsidiary_summary[(subsidiary_summary.outcome.eq("kappa")) &
+                                      subsidiary_summary.contrast.str.contains("excluding DD")].iloc[0]
+    dd_js = subsidiary_summary[(subsidiary_summary.outcome.eq("JS")) &
+                               subsidiary_summary.contrast.str.contains("within DD")].iloc[0]
+    dd_kappa = subsidiary_summary[(subsidiary_summary.outcome.eq("kappa")) &
+                                  subsidiary_summary.contrast.str.contains("within DD")].iloc[0]
     recovery = recovery_summary[recovery_summary.contrast.str.startswith("Overall")].iloc[0]
     report = ["# Focused FS/ES cardiac and microstate results", "", f"Completed: {datetime.now(timezone.utc).isoformat()}", "",
               "## Cohort and event characteristics", "", markdown_table(demographics_table, list(demographics_table.columns)), "",
@@ -819,16 +882,44 @@ def run(args) -> dict:
               "### Dense RR-derived heart rate", "", markdown_table(hr_summary, ["contrast", "median", "ci95_low", "ci95_high", "n_participants"]), "",
               "![Dense HR](figures/dense_rr_hr.png)", "", "### Microstate coverage", "",
               markdown_table(coverage_summary, ["microstate", "contrast", "median", "ci95_low", "ci95_high", "n_participants"]), "",
-              "![Coverage](figures/microstate_coverage.png)", "", "### Robust autonomic trajectories", "",
-              markdown_table(autonomic_summary, ["index", "contrast", "median", "ci95_low", "ci95_high", "probability_gt_zero", "n_participants"]), "",
-              "![Robust autonomic trajectories](figures/robust_autonomic_last_minute.png)", "", "## Primary hypothesis tests", "",
+              "![Coverage](figures/microstate_coverage.png)", "", "### Robust interictal and preictal autonomic levels", "",
+              "Raw positive CSI/CPI levels retain between-patient information; Gaussian inference is on the log scale. Ictal estimates are excluded because of ECG noise. Interictal records and final-minute preictal events are first averaged equally within each participant cell.", "",
+              markdown_table(autonomic_summary, ["index", "contrast", "median", "ci95_low", "ci95_high", "ratio_median", "ratio_ci95_low", "ratio_ci95_high", "probability_gt_zero", "n_participants"]), "",
+              "![Robust interictal and preictal autonomic levels](figures/robust_autonomic_interictal_preictal.png)", "", "## Primary hypothesis tests", "",
               f"- Final-minute C-origin JS, FS minus ES: posterior log effect {main_js['median']:.3f} (95% CrI {main_js.ci95_low:.3f} to {main_js.ci95_high:.3f}); P(FS>ES)={main_js.probability_gt_zero:.3f}.",
-              f"- Final-minute C-origin kappa, FS minus ES: {main_kappa['median']:.3f} (95% CrI {main_kappa.ci95_low:.3f} to {main_kappa.ci95_high:.3f}); P(FS>ES)={main_kappa.probability_gt_zero:.3f}.",
+              f"- Final-minute C-origin kappa, FS minus ES: posterior log effect {main_kappa['median']:.3f} (95% CrI {main_kappa.ci95_low:.3f} to {main_kappa.ci95_high:.3f}); P(FS>ES)={main_kappa.probability_gt_zero:.3f}.",
               f"- C-origin JS, hypomotor minus hypermotor FS: {semio_js['median']:.3f} (95% CrI {semio_js.ci95_low:.3f} to {semio_js.ci95_high:.3f}); P(hypo>hyper)={semio_js.probability_gt_zero:.3f}.",
               f"- Postictal correction of C-origin JS: log(post/pre) {recovery['median']:.3f} (95% CrI {recovery.ci95_low:.3f} to {recovery.ci95_high:.3f}); P(post<pre)={recovery.probability_lt_zero:.3f}.", "",
               markdown_table(transition_summary, ["outcome", "contrast", "median", "ci95_low", "ci95_high", "probability_gt_zero", "n_participants"]), "",
               "![C-origin primary](figures/c_origin_primary.png)", "", "![C-origin boxplots](figures/c_origin_final_minute_boxplots.png)", "",
-              "![C-origin JS recovery boxplots](figures/c_origin_js_recovery_boxplots.png)", "", "### Descriptive preictal κ–JS relationship", "",
+              "![C-origin JS recovery boxplots](figures/c_origin_js_recovery_boxplots.png)", "",
+              "### Raw-count and equal-information sensitivity", "",
+              f"The confirmatory sensitivity starts from the five raw C-exit counts in each 60-second window. Jeffreys-Dirichlet draws propagate finite-count uncertainty for both the event window and participant-specific interictal reference; hierarchical Bayesian-bootstrap weights represent event and participant sampling. A second analysis thins both distributions to {priorities.FIXED_EXITS} exits.", "",
+              markdown_table(raw_count_summary, ["estimand", "outcome", "contrast", "median", "ci95_low", "ci95_high", "probability_gt_zero", "n_participants"]), "",
+              "![Raw-count C-origin analyses](figures/raw_count_c_origin.png)", "",
+              "### Route, concentration and destination decomposition", "",
+              markdown_table(route_summary, ["outcome", "destination", "contrast", "median", "ci95_low", "ci95_high", "probability_gt_zero"]), "",
+              "![C-origin route and destinations](figures/c_origin_route_destinations.png)", "",
+              "### Source-state specificity", "",
+              markdown_table(specificity_summary, ["outcome", "source_state", "contrast", "median", "ci95_low", "ci95_high", "probability_gt_zero"]), "",
+              "![All-state specificity](figures/all_state_specificity.png)", "",
+              "### Matched interictal pseudo-onsets and equal-duration recovery", "",
+              "Pseudo-onsets are matched within participant on recording time, GFP-peak count, C exits, C expression and autonomic-window availability. Movement/EMG measures were not present in the exports and therefore were not represented as if matched.", "",
+              markdown_table(pseudo_summary, ["contrast", "median", "ci95_low", "ci95_high", "probability_gt_zero", "n_participants"]), "",
+              markdown_table(matched_recovery_summary, ["estimand", "outcome", "contrast", "median", "ci95_low", "ci95_high", "probability_lt_zero", "n_participants"]), "",
+              "![Matched pseudo-onsets](figures/matched_pseudo_onsets.png)", "", "### Time-resolved preictal trajectory", "",
+              markdown_table(trajectory_summary[trajectory_summary.contrast.str.contains("FS")],
+                             ["time_bin", "outcome", "contrast", "median", "ci95_low", "ci95_high", "probability_gt_zero", "n_participants"]), "",
+              "![Preictal physiology trajectory](figures/preictal_physiology_trajectory.png)", "",
+              "## Subsidiary FS versus ES comparisons", "",
+              "The non-DD models repeat the pooled adjusted model after excluding DD. The within-DD models use one FS-minus-ES log difference per complete patient pair, adjusted for within-pair differences in semiology composition and transition count.", "",
+              f"- Excluding DD, the FS/ES JS ratio was {non_dd_js.ratio_median:.3f} (95% CrI {non_dd_js.ratio_ci95_low:.3f} to {non_dd_js.ratio_ci95_high:.3f}); P(FS>ES)={non_dd_js.probability_gt_zero:.3f}.",
+              f"- Excluding DD, the FS/ES kappa ratio was {non_dd_kappa.ratio_median:.3f} (95% CrI {non_dd_kappa.ratio_ci95_low:.3f} to {non_dd_kappa.ratio_ci95_high:.3f}); P(FS>ES)={non_dd_kappa.probability_gt_zero:.3f}.",
+              f"- Within {int(dd_js.n_participants)} paired DD patients, the adjusted FS/ES JS ratio was {dd_js.ratio_median:.3f} (95% CrI {dd_js.ratio_ci95_low:.3f} to {dd_js.ratio_ci95_high:.3f}); P(FS>ES)={dd_js.probability_gt_zero:.3f}.",
+              f"- Within {int(dd_kappa.n_participants)} paired DD patients, the adjusted FS/ES kappa ratio was {dd_kappa.ratio_median:.3f} (95% CrI {dd_kappa.ratio_ci95_low:.3f} to {dd_kappa.ratio_ci95_high:.3f}); P(FS>ES)={dd_kappa.probability_gt_zero:.3f}.", "",
+              markdown_table(subsidiary_summary, ["outcome", "contrast", "median", "ci95_low", "ci95_high", "ratio_median", "ratio_ci95_low", "ratio_ci95_high", "probability_gt_zero", "n_participants"]), "",
+              "![Subsidiary C-origin comparisons](figures/c_origin_subsidiary_raw.png)", "",
+              "### Descriptive preictal κ–JS relationship", "",
               "Points are participant means after equal averaging within event and then across events; lines are descriptive regressions on log κ.", "",
               "![Preictal kappa versus JS](figures/preictal_kappa_vs_js.png)", "", "## Autonomic association with C-origin transitions in FS", "",
               "CSI and CPI are standardised to each participant's genuine interictal distribution. C-origin metrics here use the same GFP-peak backfit estimator in II and preictal records.", "",
@@ -836,19 +927,32 @@ def run(args) -> dict:
               "![Associations](figures/fs_autonomic_c_origin_correlations.png)", "", "![CPI versus kappa](figures/fs_cpi_kappa_regression.png)", "", "## Postictal recovery", "",
               markdown_table(recovery_summary, ["contrast", "median", "ci95_low", "ci95_high", "probability_lt_zero", "n_participants"]), "",
               "![Recovery](figures/c_origin_js_recovery.png)", "", "## Exploratory predictive information flow", "",
-              "These reciprocal one-window lag models test temporal prediction after each outcome's own prior value. They do not establish causal physiological direction.", "",
+              "These reciprocal one-window lag models now distinguish C coverage from C-origin JS and kappa. They test temporal prediction after each outcome's own prior value and do not establish causal physiological direction.", "",
               markdown_table(flow_summary, ["contrast", "median", "ci95_low", "ci95_high", "probability_gt_zero", "n_participants"]), "",
               "![Flow](figures/bayesian_predictive_flow.png)", "", "![CSI predicts C](figures/fs_csi_to_c_regression.png)", "",
-              f"Label-specific analyses require participant-reference absolute correlation >= {STATE_REFERENCE_MIN_CORRELATION:.2f}; {len(valid_c_participants)}/{manifest.participant.nunique()} participants met this criterion for C. All intervals are 95% Bayesian credible intervals. Descriptive cells use exact conjugate Gaussian posteriors after equal event averaging within participant and include cohort adjustment. Hypothesis and window models use participant and, where identifiable, event random intercepts. Strong directional evidence is conventionally P>0.975 or P<0.025; estimates below that threshold remain uncertain."]
+              f"Label-specific analyses require participant-reference absolute correlation >= {STATE_REFERENCE_MIN_CORRELATION:.2f}; {len(valid_c_participants)}/{manifest.participant.nunique()} participants met this criterion for C. All intervals are 95% Bayesian credible intervals. HR and coverage descriptive cells use exact conjugate Gaussian posteriors after equal event averaging within participant and include cohort adjustment. Autonomic level, hypothesis and window models use participant and, where identifiable, event random intercepts. Strong directional evidence is conventionally P>0.975 or P<0.025; estimates below that threshold remain uncertain."]
     (args.out_dir / "RESULTS.md").write_text("\n".join(report), encoding="utf-8")
     summary = {"participants": int(manifest.participant.nunique()), "c_reference_valid_participants": len(valid_c_participants),
                "ecg_records_valid": int(ecg_qc.autonomic_valid.sum()),
+               "hr_periods": sorted(hr_cells.phase.unique().tolist()),
+               "autonomic_periods": sorted(autonomic_cells.period.unique().tolist()),
+               "autonomic_level_participants": int(autonomic_cells.participant.nunique()),
                "common_windows": len(common), "main_c_js_probability_fs_gt_es": float(main_js.probability_gt_zero),
                "main_c_kappa_probability_fs_gt_es": float(main_kappa.probability_gt_zero),
-               "recovery_probability_post_lt_pre": float(recovery.probability_lt_zero)}
+               "non_dd_c_js_probability_fs_gt_es": float(non_dd_js.probability_gt_zero),
+               "dd_paired_c_js_probability_fs_gt_es": float(dd_js.probability_gt_zero),
+               "dd_complete_pairs": int(dd_js.n_participants),
+               "recovery_probability_post_lt_pre": float(recovery.probability_lt_zero),
+               **feedback_summary}
     (data_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (data_dir / "analysis_schema.json").write_text(json.dumps({"schema": ANALYSIS_SCHEMA,
-        "state_reference_min_abs_correlation": STATE_REFERENCE_MIN_CORRELATION}, indent=2), encoding="utf-8")
+        "state_reference_min_abs_correlation": STATE_REFERENCE_MIN_CORRELATION,
+        "dense_hr_periods": ["ii", "preict", "ictal"],
+        "autonomic_level_periods": ["interictal", "preictal"],
+        "autonomic_level_model": "log raw CSI/CPI",
+        "raw_count_transition_model": "Jeffreys-Dirichlet count posterior plus hierarchical event/participant Bayesian bootstrap",
+        "primary_preictal_window": "final non-overlapping 60 seconds",
+        "fixed_exit_sensitivity": priorities.FIXED_EXITS}, indent=2), encoding="utf-8")
     labels = pd.read_csv(args.results_dir / "global" / "global_manual_labels.csv").sort_values("state_index")
     label_text = ", ".join(f"{int(row.state_index)}={row.label}" for row in labels.itertuples())
     provenance_table = pd.read_csv(args.results_dir / "hierarchical_fit_summary.csv")
@@ -856,19 +960,26 @@ def run(args) -> dict:
     failures = ecg_qc[~ecg_qc.autonomic_valid.astype(bool)].reason.value_counts()
     failure_text = "; ".join(f"{reason}: {count}" for reason, count in failures.items()) or "none"
     code_files = [Path(__file__), Path(__file__).with_name("analyse_candia_autonomic.py"),
+                  Path(__file__).with_name("analyse_transition_priorities.py"),
+                  Path(__file__).with_name("export_directional_peak_windows.m"),
                   Path(__file__).with_name("run_ace_manual_pipeline.ps1"), Path(__file__).with_name("run_vg_microstates.m")]
     code_hashes = "; ".join(f"{path.name}={file_sha256(path)}" for path in code_files)
     (args.out_dir / "AUDIT.txt").write_text("\n".join(["Focused FS_MS analysis", f"Completed UTC: {datetime.now(timezone.utc).isoformat()}",
         f"Hierarchy: {args.results_dir}", f"Manifest: {args.manifest}", f"Peak windows: {args.peak_windows_csv}",
         f"Manual global labels in fitted-state order: {label_text}",
         f"SPM_MS commit: {provenance.spm_ms_commit}; SPM: {provenance.spm_version}; SPM commit: {provenance.spm_commit}; prior mode: {provenance.prior_mode}; prior weight: {provenance.spm_prior_weight}",
-        "Descriptive HR, coverage and autonomic cells: exact conjugate Gaussian posterior after equal event averaging within participant, with centred DD-cohort adjustment",
-        "Hypothesis/window models: Bayesian Gaussian mixed models with participant and eligible event random intercepts", f"Chains={args.chains}; iterations={args.iterations}; burn={args.burn}; thin={args.thin}; seed={args.seed}",
+        "Descriptive HR and coverage cells: exact conjugate Gaussian posterior after equal event averaging within participant, with centred DD-cohort adjustment",
+        "Autonomic level and hypothesis/window models: Bayesian Gaussian mixed models with participant and eligible event random intercepts", f"Chains={args.chains}; iterations={args.iterations}; burn={args.burn}; thin={args.thin}; seed={args.seed}",
         "Convergence rule: R-hat <=1.05 and ESS >=100 for every fixed and variance parameter; one deterministic doubled-length retry is allowed, otherwise the run stops",
-        "CSI/CPI: robust trailing 15-second estimates computed on each continuous source-record R-peak train, then restricted to complete windows inside each segment",
+        "Dense RR HR periods: all eligible interictal intervals, final preictal minute, and first ictal minute; records and events are equally averaged within participant cells",
+        "CSI/CPI levels: raw robust trailing 15-second indices from continuous source-record R-peak trains; log-Gaussian II/final-preictal factorial model; ictal excluded",
+        "CSI/CPI association models: standardised to each participant's interictal distribution",
+        "Subsidiary transitions: non-DD adjusted refit plus equal-patient paired DD log differences adjusted for within-pair semiology composition and transition count",
         f"State-reference QC: absolute correlation >= {STATE_REFERENCE_MIN_CORRELATION:.2f} required for every label-specific analysis; C retained {len(valid_c_participants)}/{manifest.participant.nunique()} participants",
         f"ECG autonomic QC: {int(ecg_qc.autonomic_valid.astype(bool).sum())}/{len(ecg_qc)} records retained; exclusions: {failure_text}",
         "Primary transition estimator: full-sample hard backfit; exploratory II/preict estimator: GFP-peak hard backfit",
+        f"Raw-count sensitivity: {args.transition_draws} Jeffreys-Dirichlet/Bayesian-bootstrap draws; fixed-duration final 60 seconds and fixed-{priorities.FIXED_EXITS}-C-exit estimands",
+        "Pseudo-onsets: within-participant interictal matches on time, GFP peaks, C exits, C expression and autonomic availability; movement/EMG unavailable",
         f"Code SHA-256: {code_hashes}", f"Run log: {args.out_dir / 'pipeline_run.log'}", json.dumps(summary, indent=2)]) + "\n", encoding="utf-8")
     return summary
 
@@ -880,6 +991,8 @@ def main() -> None:
     parser.add_argument("--peak-windows-csv", type=Path); parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--chains", type=int, default=4); parser.add_argument("--iterations", type=int, default=3000)
     parser.add_argument("--burn", type=int, default=1200); parser.add_argument("--thin", type=int, default=2); parser.add_argument("--seed", type=int, default=26072026)
+    parser.add_argument("--transition-draws", type=int, default=1200)
+    parser.add_argument("--retained-only", action="store_true")
     parser.add_argument("--reuse-ecg", action="store_true"); parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     if args.self_check: self_check(); print("self-check passed"); return

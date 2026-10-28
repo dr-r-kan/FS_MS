@@ -10,6 +10,10 @@ function [HResults, results_mat] = fit_microstate_hierarchical_dataset(input_pat
 %   H = fit_microstate_hierarchical_dataset();
 
     setup_microstate_paths();
+    if nargin >= 1 && isstruct(input_path) && isfield(input_path, 'command')
+        [HResults, results_mat] = run_recovery_command(input_path);
+        return;
+    end
     DEFAULT_FOLDER = fullfile(getenv('HOME'), 'EEG', 'LEMON');
 
     if nargin < 1 || isempty(input_path)
@@ -2237,6 +2241,7 @@ function T = summarise_preictal_time_bins(backfit, Results, gfp, X_metric, sfreq
             sequence = assignments(idx);
             sequence = sequence(isfinite(sequence) & sequence >= 1 & sequence <= size(weights, 2));
             if ~isempty(sequence)
+                sequence = sequence(:);
                 sequence = sequence([true; diff(sequence) ~= 0]);
             end
             transition_counts = zeros(size(weights, 2));
@@ -3287,6 +3292,125 @@ function Fit = fit_spm_vb_peak_maps(maps, gfp, K_candidates, cfg, fit_name, prio
         error('Child observation count changed during hierarchical fitting.');
     end
     Fit.runtime = toc(t0);
+end
+
+function [output, detail] = run_recovery_command(request)
+% Narrow public bridge for deterministic recovery from preserved peak caches.
+    command = lower(strtrim(char(string(request.command))));
+    detail = '';
+    util = microstate_utilities();
+    switch command
+        case 'fit_global_maps'
+            required = {'maps','gfp','cfg','common_labels','common_chanlocs','manual_labels'};
+            for i = 1:numel(required)
+                if ~isfield(request, required{i})
+                    error('Recovery request is missing %s.', required{i});
+                end
+            end
+            cfg = request.cfg;
+            cfg.K_candidates = 6;
+            cfg.spm_prior_weight = 1;
+            if ~isfield(cfg, 'criterion'), cfg.criterion = 'free_energy_elbow'; end
+            if ~isfield(cfg, 'template_reference_K'), cfg.template_reference_K = 7; end
+            if ~isfield(cfg, 'template_file') || ~isfile(cfg.template_file)
+                repo_cfg = util.load_config();
+                cfg.template_file = repo_cfg.paths.template_file;
+            end
+            repo_cfg = util.load_config();
+            [spm_ok, spm_info] = util.ensure_spm_mix('', repo_cfg.paths.spm_mixture_paths, false);
+            if ~spm_ok
+                error('SPM spm_mix not found. Checked: %s', strjoin(spm_info.attempted, ', '));
+            end
+            rng(1, 'twister');
+            output = fit_spm_vb_peak_maps(request.maps, request.gfp, 6, cfg, ...
+                'recovered_global', [], 'none');
+            output = apply_manual_global_labels_by_state_order(output, request.manual_labels, cfg, ...
+                request.common_labels, request.common_chanlocs);
+            output.template_alignment.manual_label_source = 'recovered_authoritative_mapping';
+        case 'extract_peak_record'
+            required = {'file_path','common_can','common_pos','cfg'};
+            for i = 1:numel(required)
+                if ~isfield(request, required{i})
+                    error('Recovery request is missing %s.', required{i});
+                end
+            end
+            manifest = table(string(request.file_path), 'VariableNames', {'file_path'});
+            meta = inspect_files(manifest, request.cfg, util);
+            output = extract_file_peaks(request.file_path, meta(1), request.common_can, ...
+                request.common_pos, request.cfg, util);
+        case 'timestamped_transitions'
+            required = {'file_path','common_can','common_pos','cfg','fit'};
+            for i = 1:numel(required)
+                if ~isfield(request, required{i})
+                    error('Recovery request is missing %s.', required{i});
+                end
+            end
+            [Sim, ~, X_metric] = prepare_backfit_record(request.file_path, request.common_can, ...
+                request.common_pos, request.cfg, util);
+            validate_full = isfield(request, 'validate_full_backfit') && request.validate_full_backfit;
+            sfreq = double(Sim.sfreq);
+            if ~validate_full
+                Sim.X_noisy = [];
+            end
+            gfp = sqrt(mean((double(X_metric) - mean(double(X_metric), 1)).^2, 1));
+            min_dist = max(1, round(double(request.cfg.gfp_peak_min_distance)));
+            peak_sample = exact_local_peak_finder(gfp, min_dist);
+            peak_maps = util.normalize_maps(double(X_metric(:, peak_sample))');
+            centers = util.normalize_maps(double(request.fit.centers));
+            [~, peak_assignment] = max(abs(peak_maps * centers'), [], 2);
+            changes = find(peak_assignment(2:end) ~= peak_assignment(1:end-1));
+            transition_sample = floor((peak_sample(changes) + peak_sample(changes + 1)) / 2) + 1;
+            output = struct( ...
+                'file_path', char(request.file_path), ...
+                'sfreq', sfreq, ...
+                'n_samples', double(size(X_metric, 2)), ...
+                'peak_sample', uint32(peak_sample(:)), ...
+                'peak_assignment', uint8(peak_assignment(:)), ...
+                'transition_sample', uint32(transition_sample(:)), ...
+                'from_state', uint8(peak_assignment(changes)), ...
+                'to_state', uint8(peak_assignment(changes + 1)));
+            output.full_backfit_validation = false;
+            if validate_full
+                backfit = backfit_microstate_timecourse(Sim, request.fit);
+                if ~backfit.ok || ~strcmp(backfit.hard.mode, 'gfp_peaks_interpolated')
+                    error('Full backfit validation failed for %s: %s', request.file_path, backfit.message);
+                end
+                full_assignment = uint8(backfit.hard.assignments(:));
+                full_sample = uint32(find(full_assignment(2:end) ~= full_assignment(1:end-1)) + 1);
+                if ~isequal(full_sample(:), output.transition_sample(:)) || ...
+                        ~isequal(full_assignment(double(full_sample) - 1), output.from_state(:)) || ...
+                        ~isequal(full_assignment(double(full_sample)), output.to_state(:))
+                    error('Compact transition export disagrees with the full hard backfit for %s.', request.file_path);
+                end
+                output.full_backfit_validation = true;
+            end
+        otherwise
+            error('Unknown recovery command: %s', command);
+    end
+end
+
+function idx = exact_local_peak_finder(x, min_dist)
+% Identical selection rule to backfit_microstate_timecourse.
+    x = double(x(:)');
+    idx = [];
+    if numel(x) < 3, return; end
+    cand = find(x(2:end-1) >= x(1:end-2) & x(2:end-1) > x(3:end)) + 1;
+    if isempty(cand)
+        [~, idx] = max(x);
+        return;
+    end
+    [~, order] = sort(x(cand), 'descend');
+    cand = cand(order);
+    taken = false(size(x));
+    keep = false(size(cand));
+    for i = 1:numel(cand)
+        c = cand(i);
+        bounds = max(1, c - min_dist):min(numel(x), c + min_dist);
+        if any(taken(bounds)), continue; end
+        keep(i) = true;
+        taken(bounds) = true;
+    end
+    idx = sort(cand(keep), 'ascend');
 end
 
 function prior_K = ensure_k_prior_maps(prior_maps, X, K)
