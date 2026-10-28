@@ -1,8 +1,8 @@
 {
-  "created_utc": "2026-10-28T03:17:06.389350+00:00",
+  "created_utc": "2026-10-28T03:50:24.536815+00:00",
   "external_tree_sha256": {
-    "HEPPy": "20f157a2f2cb7e0d3297ac57665e54777339681bea96a58db7bda2ab2b47c42a",
-    "VG-microstates": "4aca26050e15036641a9072ba59d1033cf0101942c7643f5e0e6ba1e5c2e01fa"
+    "HEPPy": "b4200a544c2305d21277d35f65be18006b1e4ca883e3ca41c712717665ffa160",
+    "VG-microstates": "86a95b11a1d29b6a81a4bd05ac4492f7ca1e36ef3b2ebc06e216c78dd9ac3185"
   },
   "files": {
     "PREREGISTRATION.md": "98b35e0034d0a6ba5e5ed9499f7e63556f42e65c16d0f8f1d018a4433ed30cd4",
@@ -13,9 +13,9 @@
     "config/study.json": "bbee1f480a874a14bd8b034cbfe0e5c1a5626719713deb5f37504e6adcdea042",
     "docs/STATISTICAL_ANALYSIS_PLAN.md": "ea11ba17c32d2d4de5eabbc40a91e160097a202b88a6bcb7616f92e34fca5f92",
     "export_directional_peak_windows.m": "066ab2422ce113b8fafa786de43d3bff87626f8684dcff82be6f2ee8bf30372e",
-    "external/PROVENANCE.json": "260576a86a90be90d96612305a8f570ba6bdf3c7b6156884c50d2f464a339883",
+    "external/PROVENANCE.json": "3ddd794473ff3ff27fa5a857da1639d4b2a7d9fd3f2fae0b9b20aceb568ea1b4",
     "fsms/__init__.py": "2b3d101efaf3410b9883adc9ffcd9fee6ff18158dcacd6720ce753b18e298151",
-    "fsms/atomic.py": "da76db46886986c64ad21f9a79dc832e7d9ab7901885d26e83d3aac6064267cd",
+    "fsms/atomic.py": "0117abba435316f9ca64b81a9207c134413764eae8ead2c7f5ae0df541f5d7a1",
     "fsms/autonomic.py": "415499cfb2a804d8980a61817f9c6daf480f7c9af6ed5201bd25cf6c475945ca",
     "fsms/clips/__init__.py": "6f0e370414e659cea2338bef4daa64ae282371a70eaf5b86c1f4dc91479796e0",
     "fsms/clips/modes.py": "97469e5f75ff12e90e0f375121d48e9f12c128ea728680bf40c19ad0988716f5",
@@ -75,7 +75,7 @@
   },
   "git": {
     "branch": "preregistration-ready-pipeline",
-    "head": "fcd54dcaa4a58ada0778f793c30457137a41ae3c",
+    "head": "57513f7744ad867cd218e0ffdb983f8b910225d1",
     "uncommitted_paths_excluding_prereg": []
   },
   "hash_algorithm": "SHA-256",
