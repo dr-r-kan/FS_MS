@@ -1,0 +1,7 @@
+{
+  "attestation": "recorded by the investigator; syntax and lock hash are checked, the immutable status of the OSF record is not independently certified",
+  "plan_lock_sha256": "0b30846e4b05796ecf894f283f0299121b22964b2abb2d8b4160af1d4b2f6631",
+  "recorded_utc": "2026-10-29T08:03:40.954532+00:00",
+  "registration_url": "https://osf.io/nuf95",
+  "schema": "fs-ms-registration-record/v1"
+}
